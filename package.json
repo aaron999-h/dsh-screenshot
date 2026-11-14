@@ -1,0 +1,56 @@
+{
+  "name": "dsh-screenshot",
+  "version": "1.0.0",
+  "description": "Adds a screenshot entry to the composer's + menu: pick a region anywhere on the desktop (DSH stays visible) and the crop lands in the draft as an image attachment.",
+  "type": "module",
+  "license": "MIT",
+  "author": "aaron999-h",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "screenshot",
+    "snip",
+    "capture",
+    "desktop"
+  ],
+  "icon": "assets/icon.svg",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aaron999-h/dsh-screenshot.git"
+  },
+  "homepage": "https://github.com/aaron999-h/dsh-screenshot",
+  "bugs": {
+    "url": "https://github.com/aaron999-h/dsh-screenshot/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./assets/icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/",
+    "docs/",
+    "assets/",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-commands"
+      ]
+    }
+  }
+}
