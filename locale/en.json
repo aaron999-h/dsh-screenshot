@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Screenshot",
+    "description": "Adds a screenshot row to the composer menu: capture a region of the screen and attach it to the draft.",
+    "detail": "README.md"
+  }
+}
