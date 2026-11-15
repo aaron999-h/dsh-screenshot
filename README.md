@@ -11,8 +11,21 @@ Adds a **Screenshot** row to the composer's `+` menu. Pick a window or drag a re
   - The toolbar is one white row, right-aligned to the selection: `矩形 椭圆 直线 箭头 画笔 马赛克 文字 ｜ 撤销 重做 ｜ 复制 另存为 ｜ ✕ 取消 ✓ 插入`.
   - The colour / width row appears underneath only when a shape tool is active (or such a shape is selected). For text it reads **小 / 中 / 大** and sets the font size instead.
   - Shapes stay selected after you draw them: drag the handles to resize, drag a line's endpoints to change length and direction, drag inside to move, `Delete` to remove. `Ctrl+Z` / `Ctrl+Y` walk undo and redo.
+  - The toolbar also carries a **scrolling capture** button (page + down arrow, its own group right of 文字) — see below.
 - **✓ 插入**: the composited crop is inserted into the current draft as a PNG attachment, through the very same intake a real Ctrl+V image paste uses (so the usual caps, busy refusal and upload staging apply). **复制** puts it on the clipboard, **另存为** writes PNG/JPEG/BMP.
 - **Right-click** or **Esc** cancels; no attachment is created.
+
+## Scrolling capture
+
+For pages taller than the screen (chat history, long articles, long documents):
+
+1. Pick the region through the normal flow, then press the **scrolling capture** button in the toolbar.
+2. A small hint strip appears outside your selection and reports how many pixels have been stitched so far. Now scroll the window underneath (wheel, `PgDn`, whatever it uses).
+3. Press **完成 / Done** on the strip (or `Enter`) when you reach the bottom.
+4. The stitched image comes back **in the same annotator window** — scaled to fit, background dimmed, toolbar still there, nothing is inserted automatically. Annotate it if you want, then decide: `✓` inserts, `复制` copies, `另存为` saves, `✕` / `Esc` discards.
+   - In this result view the scrolling button is greyed out, the other tools keep working, and annotations you already drew can still be selected with the 8 handles, stretched, moved and deleted — the mouse is mapped back to the original pixels, so the exported image stays full resolution.
+
+How the stitching works: the region is sampled every 320 ms, adjacent frames are compared row by row (SAD) to measure how far the content moved up, and only the newly revealed bottom rows are appended. A frame that did not move, or a page that changed entirely, is ignored. Height is capped at 24000 px and one session may run 180 s. The detector has a standalone self-test (`[DshShot.Editor]::ScrollSelfTest($dir)`): it renders a long page, feeds it in as slices and compares pixels.
 
 ## Install
 
@@ -24,7 +37,7 @@ Or add `"dsh-screenshot"` to `dsh.profile.bundles` in your profile and let the l
 
 ## How it works
 
-- **Host half** (`index.js`): registers `POST /screenshot/v6/capture` (guarded by a `x-dsh-screenshot: 1` header plus a same-origin check) and `GET /screenshot/v6/status`. One PowerShell script declares per-monitor DPI awareness, grabs the whole virtual screen (`SystemInformation.VirtualScreen`, so all monitors) as the frozen frame, compiles `editor.cs`, and runs it. The result — the annotated crop, or a cancel — comes back through a small JSON file; the Host answers with a base64 data URL. The page cannot capture pixels itself (its Electron session denies display media and blocks http(s) subresources), so the pixels have to come from the Host process.
+- **Host half** (`index.js`): registers `POST /screenshot/v7/capture` (guarded by a `x-dsh-screenshot: 1` header plus a same-origin check) and `GET /screenshot/v7/status`. One PowerShell script declares per-monitor DPI awareness, grabs the whole virtual screen (`SystemInformation.VirtualScreen`, so all monitors) as the frozen frame, compiles `editor.cs`, and runs it. The result — the annotated crop, or a cancel — comes back through a small JSON file; the Host answers with a base64 data URL. The page cannot capture pixels itself (its Electron session denies display media and blocks http(s) subresources), so the pixels have to come from the Host process.
 - **Editor half** (`editor.cs`, shipped in the package and compiled with `Add-Type` at capture time): one borderless top-most WinForms window over the frozen frame does both phases — pick (`DwmGetWindowAttribute` window bounds, green frame + dim, drag rectangle with live dim and size badge, bottom hint), then annotate (floating white toolbar, on-demand colour/size row, GDI+ drawn icons, `Compose()` renders the selection at native resolution).
 - **Client half** (`client.js`): registers one `ctx.commandUi` contribution (the row) and one `conversation.input.overlay` entry (the small failure card with a retry button). After the capture it first tries `inputActions.addFiles`, and otherwise dispatches a synthetic `ClipboardEvent('paste')` carrying a `DataTransfer` at the document — which is the supported door into the composer's document-level paste intake.
 
@@ -51,4 +64,4 @@ Only those four names land in the **Add** group; every other row — including p
 dsh plugin remove dsh-screenshot
 ```
 
-It only adds one menu row, one overlay entry and two Host routes; nothing else is touched.
+It only adds one menu row, one overlay entry and two Host routes; nothing else is touched. The scrolling capture reuses the same window and the same route (`?mode=scroll`).
