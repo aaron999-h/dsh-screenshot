@@ -31,12 +31,24 @@
    - **✕ 取消**：放弃本次截图；`Esc` 依次是「取消选中 → 退出当前工具 → 退出选区 → 取消截图」。
 4. 图片进入输入框后与手动粘贴的图片走同一条通道，附件数量/体积上限、发送中拒绝等规则都由 composer 判断。
 
+## 滚动截图
+
+标注工具条里还有一个 **滚动截图** 按钮（在「文字」右边、独立一组），用来把一屏放不下的长页面（聊天记录、长网页、长文档）拍成一张长图：
+
+1. 点 `+` → **截图提问**，先选窗口或框选一块**要跟随滚动的区域**，再点工具条上的 **滚动截图** 按钮。
+2. 选区确定后，屏幕上会出现一条小的「滚动截图」提示条（自动避开选区，不会挡住画面），提示条上实时显示已拼接的高度。
+3. 用鼠标滚轮在选区里往下滚，滚到底后点提示条上的 **完成**（或按 Enter）；点 **取消** / Esc 放弃。
+4. 拼好后**不会**自动贴进输入框：长图会回到同一个标注窗口里（按屏幕高度缩放显示，背景压暗），下面还是那条工具条，由你自己决定——`✓` 插入对话、`复制`、`另存为`，或 `Esc` / `✕` 放弃；此时「滚动截图」按钮变灰（避免对同一结果再次滚动），其余标注工具照常可用，标注会按原图分辨率写进长图；画完的矩形 / 椭圆 / 直线 / 箭头 / 文字照样可以点中后用 8 个控制点拉伸、拖动整体移动、`Delete` 删除（缩放显示下按比例换算，落点仍是原图像素）。
+5. 插入后文件名形如 `scrollshot-20261115-170412.png`。
+
+实现要点：滚轮滚动时每隔 320 ms 抓一次选区，用相邻两帧做逐行差分（SAD）算出内容上移了多少像素，只把新露出来的那几行接到长图底部；同一帧重复出现（没在滚动）或画面完全变化（换了页面）都不会被误接。上限 24000 px，单次最多等 180 秒。拼接算法有独立自检（`[DshShot.Editor]::ScrollSelfTest($dir)`），会渲染一张长页面、切片喂进去再逐像素比对。
+
 ## 实现
 
-- **Host 半（`index.js`）**：注册 `POST /screenshot/v6/capture`（要求 `x-dsh-screenshot: 1` 且同源）与 `GET /screenshot/v6/status`。PowerShell 只负责三件事：声明 per-monitor DPI 感知、把整个虚拟屏幕抓成 `full.png`、编译并运行 `editor.cs`；最终以 base64 data URL 把标注后的图返回页面。
+- **Host 半（`index.js`）**：注册 `POST /screenshot/v7/capture`（要求 `x-dsh-screenshot: 1` 且同源；`?mode=scroll` 走滚动截图）与 `GET /screenshot/v7/status`。PowerShell 只负责三件事：声明 per-monitor DPI 感知、把整个虚拟屏幕抓成 `full.png`、编译并运行 `editor.cs`；最终以 base64 data URL 把标注后的图返回页面。
 - **编辑器（`editor.cs`）**：随包发布的 C# 5 源码，抓图时用 `Add-Type` 现场编译。一个无边框、置顶、覆盖所有显示器的 WinForms 窗口同时承担「选」和「标」：`EnumWindows` + `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` 找光标下窗口、拖动中实时重算选区并压暗其外、GDI+ 手绘图标与工具条、`Compose()` 按原始分辨率合成输出。
 - **启动方式**：由 Host 直接 `spawn` PowerShell 并等待结束（`-STA` 必需）。`explorer`/`wscript` 之类的绕行链路会把窗口开到不可见桌面上，不要改成那种方式。
-- **Client 半（`client.js`）**：注册 `+` 菜单的命令行（`ctx.commandUi.register`，名字 `screenshot`），并在 `conversation.input.overlay` 上挂一个只在失败时出现的提示卡片（可重试）。拿到 PNG 后先尝试 `inputActions.addFiles`，否则派发合成粘贴事件，交回 composer 的文档级粘贴入口。
+- **Client 半（`client.js`）**：注册 `+` 菜单里的一条命令行（`ctx.commandUi.register`，名字 `screenshot`；滚动截图由工具条按钮发起，不占菜单行），并在 `conversation.input.overlay` 上挂一个只在失败时出现的提示卡片（可重试）。拿到 PNG 后先尝试 `inputActions.addFiles`，否则派发合成粘贴事件，交回 composer 的文档级粘贴入口。
 - 排查用日志：`%TEMP%\dsh-screenshot.log`（`capture ok 宽x高 in 毫秒`）与 `%TEMP%\dsh-screenshot-editor.log`（hover、`finish 动作`）。
 
 ## 为什么不是「添加」分组里的一行
@@ -45,8 +57,8 @@
 
 ## 平台
 
-截屏与标注目前只在 **Windows** 上实现；其他平台 `GET /screenshot/v6/status` 返回 `supported: false`，浏览器页面（非桌面端）里这一行不出现。
+截屏与标注目前只在 **Windows** 上实现；其他平台 `GET /screenshot/v7/status` 返回 `supported: false`，浏览器页面（非桌面端）里这一行不出现。
 
 ## 卸载
 
-在插件管理里移除 `dsh-screenshot` 即可；它只注册一个菜单命令、一个提示卡片插槽和两个 Host 路由。
+在插件管理里移除该 bundle 即可；它只注册两条菜单命令、一个提示卡片插槽和两个 Host 路由。
