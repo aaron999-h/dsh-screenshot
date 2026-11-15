@@ -22,7 +22,7 @@ import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { appendFile, copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const inject = ['webServer']
@@ -32,6 +32,87 @@ const HEADER = 'x-dsh-screenshot'
 const ROUTE_PREFIX = '/screenshot/v7'
 const SELECT_TIMEOUT_MS = 600000
 const LOG_PATH = join(tmpdir(), 'dsh-screenshot.log')
+
+/**
+ * Global hotkey (Alt+A) support.
+ *
+ * A Desktop plugin lives in the Host child process and cannot ask Electron for
+ * `globalShortcut`, so the shortcut is registered with Win32 `RegisterHotKey`
+ * from a tiny .NET helper the Host compiles once and keeps alive. The helper is
+ * outside the renderer, so it also fires while the window is minimized or
+ * behind another application — exactly where an in-app key binding is dead.
+ * A press only touches a signal file; the Host notices it, runs the same
+ * capture pipeline, and parks the PNG for the page to claim.
+ */
+const HOTKEY_MODIFIERS = 1 // MOD_ALT
+const HOTKEY_KEY = 0x41 // VK_A
+const HOTKEY_SIGNAL = join(tmpdir(), 'dsh-screenshot-hotkey.signal')
+const HOTKEY_SOURCE_FILE = join(tmpdir(), 'dsh-screenshot-hotkey.cs')
+const HOTKEY_SCRIPT_FILE = join(tmpdir(), 'dsh-screenshot-hotkey.ps1')
+
+const HOTKEY_SOURCE = `using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public static class DshHotkey
+{
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool RegisterHotKey(IntPtr window, int id, uint modifiers, uint key);
+
+    [DllImport("user32.dll")]
+    private static extern bool PeekMessage(out MSG message, IntPtr window, uint filterMin, uint filterMax, uint flags);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT { public int X; public int Y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSG
+    {
+        public IntPtr hwnd;
+        public uint message;
+        public IntPtr wParam;
+        public IntPtr lParam;
+        public uint time;
+        public POINT pt;
+        public uint lPrivate;
+    }
+
+    public static int Run(string signal, int modifiers, int key)
+    {
+        string error = signal + ".error";
+        try { File.Delete(error); } catch { }
+        if (!RegisterHotKey(IntPtr.Zero, 1, (uint)modifiers, (uint)key))
+        {
+            try { File.WriteAllText(error, "register-failed " + Marshal.GetLastWin32Error().ToString()); } catch { }
+            return 3;
+        }
+        for (;;)
+        {
+            MSG message;
+            while (PeekMessage(out message, IntPtr.Zero, 0, 0, 1))
+            {
+                if (message.message == 0x0312)
+                {
+                    try { File.WriteAllText(signal, DateTime.Now.ToString("o")); } catch { }
+                }
+            }
+            Thread.Sleep(25);
+        }
+    }
+}
+`
+
+const HOTKEY_WRAPPER = `param([string]$Signal, [string]$Source, [int]$Modifiers, [int]$Key)
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition ([System.IO.File]::ReadAllText($Source)) -Language CSharp
+[DshHotkey]::Run($Signal, $Modifiers, $Key) | Out-Null
+`
+
+/** Result parked for the page: a capture finished while the window was away. */
+let pendingShot
+/** Locale of the last page request, reused for a hotkey capture's hint text. */
+let lastLocale
 
 /** Selector hints per locale; the selection window is drawn by PowerShell. */
 const HINTS = {
@@ -297,6 +378,20 @@ function rejection(context, request) {
 }
 
 /**
+ * Gate a read: this plugin's header plus the same origin rules, without the
+ * POST restriction, so the page can poll for a hotkey result.
+ * @returns an error message, or undefined when the request may proceed.
+ */
+function readGuard(context, request) {
+  if (request.headers[HEADER] !== '1') return `missing ${HEADER} header`
+  const origin = request.headers.origin
+  if (origin === undefined) return undefined
+  if (origin === 'dsh-app://app') return undefined
+  if (origin === context.webServer.getOrigin()) return undefined
+  return 'unexpected origin'
+}
+
+/**
  * Register one exact route, tolerating a route table that already owns it.
  *
  * The loader can instantiate a bundle entry twice while a plugin is being
@@ -320,12 +415,129 @@ function registerRoute(context, path, handler, label) {
     }
   }, label)
 }
+const RAISE_SCRIPT_FILE = join(tmpdir(), 'dsh-screenshot-raise.ps1')
+
+const RAISE_WRAPPER = `param([string]$ProcessName)
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class DshRaise {
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
+}
+'@
+$process = Get-Process -Name $ProcessName | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+if ($process -ne $null) {
+  $handle = $process.MainWindowHandle
+  [void][DshRaise]::ShowWindow($handle, 9)
+  Start-Sleep -Milliseconds 120
+  [void][DshRaise]::SetForegroundWindow($handle)
+}
+`
+
+/**
+ * Bring the Desktop window back to the front after a hotkey capture.
+ *
+ * The user asked for a shortcut that works while the app is minimized or
+ * behind something else; once the pixels are in hand the composer has to be
+ * visible to receive them, so the window is restored and raised again.
+ * `AppActivate` alone leaves a minimized window minimized, hence ShowWindow.
+ */
+function activateApp() {
+  if (!desktopHost()) return
+  const name = basename(process.execPath, extname(process.execPath))
+  spawn('powershell.exe', [
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', RAISE_SCRIPT_FILE, '-ProcessName', name,
+  ], { windowsHide: true, stdio: 'ignore' })
+}
+
+/**
+ * Keep a global Alt+A listener alive and hand each press to `onPress`.
+ *
+ * The helper is compiled once from {@link HOTKEY_SOURCE}; the signal file is
+ * written by the helper and polled here, which avoids any HTTP round trip from
+ * a process that has no business knowing the page token.
+ *
+ * @param onPress - called once per physical press.
+ * @returns disposer stopping the helper and the poll.
+ */
+async function startHotkey(onPress) {
+  if (process.platform !== 'win32' || !desktopHost()) return () => {}
+  await writeFile(HOTKEY_SOURCE_FILE, HOTKEY_SOURCE, 'utf8')
+  await writeFile(HOTKEY_SCRIPT_FILE, HOTKEY_WRAPPER, 'utf8')
+  await writeFile(RAISE_SCRIPT_FILE, RAISE_WRAPPER, 'utf8')
+  await rm(HOTKEY_SIGNAL, { force: true }).catch(() => {})
+  await rm(`${HOTKEY_SIGNAL}.error`, { force: true }).catch(() => {})
+  const child = spawn('powershell.exe', [
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', HOTKEY_SCRIPT_FILE,
+    '-Signal', HOTKEY_SIGNAL, '-Source', HOTKEY_SOURCE_FILE,
+    '-Modifiers', String(HOTKEY_MODIFIERS), '-Key', String(HOTKEY_KEY),
+  ], { windowsHide: true, stdio: 'ignore' })
+  journal(`hotkey helper pid=${String(child.pid ?? 0)}`)
+  child.on('exit', (code) => { journal(`hotkey helper exited code=${String(code)}`) })
+  child.on('error', (error) => { journal(`hotkey helper error=${error instanceof Error ? error.message : String(error)}`) })
+
+  let lastSignal
+  const timer = setInterval(() => {
+    readFile(HOTKEY_SIGNAL, 'utf8')
+      .then((text) => {
+        const stamp = text.trim()
+        if (stamp === '' || stamp === lastSignal) return
+        lastSignal = stamp
+        onPress()
+      })
+      .catch(() => {})
+    readFile(`${HOTKEY_SIGNAL}.error`, 'utf8')
+      .then((text) => { journal(`hotkey unavailable: ${text.trim()}`) })
+      .catch(() => {})
+  }, 300)
+
+  return () => {
+    clearInterval(timer)
+    try { child.kill() } catch { /* already gone */ }
+  }
+}
+
 /**
  * Register the capture routes.
  * @param ctx - Host plugin context.
  */
 export function apply(ctx) {
   let busy = false
+
+  /** Capture started by the global hotkey: park the PNG for the page. */
+  async function hotkeyCapture(selfTestRect) {
+    if (busy) {
+      journal('hotkey ignored: a selection is already open')
+      return
+    }
+    busy = true
+    const started = Date.now()
+    try {
+      const shot = await capture(lastLocale ?? 'zh', selfTestRect)
+      pendingShot = { image: shot.image, width: shot.width, height: shot.height, at: Date.now() }
+      journal(`hotkey capture ok ${String(shot.width)}x${String(shot.height)} in ${String(Date.now() - started)}ms`)
+      activateApp()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      journal(`hotkey capture failed after ${String(Date.now() - started)}ms: ${message}`)
+    } finally {
+      busy = false
+    }
+  }
+
+  ctx.effect(() => {
+    let dispose = () => {}
+    let stopped = false
+    startHotkey(() => { void hotkeyCapture() })
+      .then((off) => { if (stopped) off(); else dispose = off })
+      .catch((error) => {
+        journal(`hotkey start failed: ${error instanceof Error ? error.message : String(error)}`)
+      })
+    return () => { stopped = true; dispose() }
+  }, 'dsh-screenshot: global hotkey')
 
   registerRoute(ctx, ROUTE_PREFIX + '/status', (request, response) => {
     const url = new URL(request.url ?? '/', 'http://localhost')
@@ -337,6 +549,43 @@ export function apply(ctx) {
       selfTest: url.searchParams.get('selftest') === '1',
     })
   }, 'dsh-screenshot: status route')
+
+  registerRoute(ctx, ROUTE_PREFIX + '/pending', (request, response) => {
+    const refused = readGuard(ctx, request)
+    if (refused !== undefined) {
+      sendJson(response, 403, { ok: false, error: refused })
+      return
+    }
+    sendJson(response, 200, {
+      ok: true,
+      pending: pendingShot !== undefined,
+      ...(pendingShot === undefined ? {} : {
+        image: pendingShot.image, width: pendingShot.width, height: pendingShot.height, at: pendingShot.at,
+      }),
+    })
+  }, 'dsh-screenshot: pending route')
+
+  registerRoute(ctx, ROUTE_PREFIX + '/pending/ack', (request, response) => {
+    const refused = rejection(ctx, request)
+    if (refused !== undefined) {
+      sendJson(response, 403, { ok: false, error: refused })
+      return
+    }
+    pendingShot = undefined
+    journal('pending shot claimed')
+    sendJson(response, 200, { ok: true })
+  }, 'dsh-screenshot: pending ack route')
+
+  registerRoute(ctx, ROUTE_PREFIX + '/hotkey', async (request, response) => {
+    const refused = rejection(ctx, request)
+    if (refused !== undefined) {
+      sendJson(response, 403, { ok: false, error: refused })
+      return
+    }
+    const url = new URL(request.url ?? '/', 'http://localhost')
+    await hotkeyCapture(url.searchParams.get('selftest') === '1' ? '120,160,600,360' : undefined)
+    sendJson(response, 200, { ok: true, pending: pendingShot !== undefined })
+  }, 'dsh-screenshot: hotkey route')
 
   registerRoute(ctx, ROUTE_PREFIX + '/capture', async (request, response) => {
     const refused = rejection(ctx, request)
