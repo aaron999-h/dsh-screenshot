@@ -1,12 +1,12 @@
 /**
  * Screenshot-to-draft plugin, Client half.
  *
- * Registers a 「截图提问」 row in the composer `+` menu (the command menu shared
- * with a typed `/`). The row asks the Host to run a desktop-wide selector with
- * the WeChat-style annotator, then hands the returned crop to the composer as
- * if the user had pasted an image: the composer has no public "add this File"
- * call for sibling plugins, while its document-level paste route is exactly the
- * door a real Ctrl+V uses, caps and busy refusal included.
+ * Adds a screenshot button beside the composer's `+` control. The button asks
+ * the Host to run a desktop-wide region selector, then hands the returned crop
+ * to the composer as if the user had pasted an image: the composer has no
+ * public "add this File" call for sibling plugins, while its document-level
+ * paste route is exactly the door a real Ctrl+V uses, caps and busy refusal
+ * included.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-screenshot',
@@ -24,6 +24,7 @@ window.__ModuleLoader__.load({
     const en = {
       rowLabel: 'Screenshot',
       rowDescription: 'Select a region on the desktop and attach it to the draft',
+
       failedTitle: 'Selection failed',
       captureFailed: 'Could not capture the screen: {error}',
       attachFailed: 'Could not attach the image: {error}',
@@ -36,6 +37,7 @@ window.__ModuleLoader__.load({
     const zh = {
       rowLabel: '截图提问',
       rowDescription: '在全桌面框选一块区域，并把截图添加到对话里',
+
       failedTitle: '截图失败',
       captureFailed: '截屏失败：{error}',
       attachFailed: '添加图片失败：{error}',
@@ -94,6 +96,7 @@ window.__ModuleLoader__.load({
       )
     }
 
+
     /* ------------------------------------------------------------------ *
      * Translation (a slot normally hands one over)
      * ------------------------------------------------------------------ */
@@ -123,6 +126,7 @@ window.__ModuleLoader__.load({
      * ------------------------------------------------------------------ */
     function createSurface() {
       let state = { open: false, phase: 'idle', error: undefined }
+
       const listeners = new Set()
       let deliver = undefined
 
@@ -133,6 +137,7 @@ window.__ModuleLoader__.load({
 
       return {
         get state() { return state },
+
         getSnapshot: () => state,
         subscribe(listener) {
           listeners.add(listener)
@@ -184,16 +189,20 @@ window.__ModuleLoader__.load({
 
     /**
      * Ask the Host for a fresh region and hand the crop to the composer.
+     * A scrolling capture is started from the annotator's own toolbar, so the
+     * file name here is decided by what the Host actually produced.
      * @param surface - this Session's surface.
      */
     async function run(surface) {
       if (!surface.start()) return
       try {
-        const body = await post('screenshot/v6/capture', { lang: localeId() })
+        const query = { lang: localeId() }
+        const body = await post('screenshot/v7/capture', query)
         const blob = await (await fetch(body.image)).blob()
         const stamp = new Date()
         const pad = (value) => String(value).padStart(2, '0')
-        const name = `screenshot-${String(stamp.getFullYear())}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}${pad(stamp.getSeconds())}.png`
+        const prefix = body.mode === 'scroll' ? 'scrollshot' : 'screenshot'
+        const name = `${prefix}-${String(stamp.getFullYear())}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}${pad(stamp.getSeconds())}.png`
         const file = new File([blob], name, { type: 'image/png' })
         if (!surface.deliver(file)) throw new Error(fallbackTranslate('attachRefused'))
         surface.close()
