@@ -425,14 +425,29 @@ using System.Runtime.InteropServices;
 public static class DshRaise {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr window);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int cx, int cy, uint flags);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+
+  // Windows only lets the foreground process take the foreground, so a
+  // background helper has to (a) bounce itself into the z-order with a
+  // TOPMOST/NOTOPMOST pass and (b) unlock the foreground lock with a synthetic
+  // ALT tap, which is the documented workaround for SetForegroundWindow.
+  public static void Raise(IntPtr window) {
+    ShowWindow(window, 9);                       // SW_RESTORE: also un-minimizes
+    SetWindowPos(window, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040);
+    SetWindowPos(window, new IntPtr(-2), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040);
+    BringWindowToTop(window);
+    keybd_event(0x12, 0, 0, UIntPtr.Zero);
+    keybd_event(0x12, 0, 2, UIntPtr.Zero);
+    SetForegroundWindow(window);
+  }
 }
 '@
 $process = Get-Process -Name $ProcessName | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
 if ($process -ne $null) {
-  $handle = $process.MainWindowHandle
-  [void][DshRaise]::ShowWindow($handle, 9)
-  Start-Sleep -Milliseconds 120
-  [void][DshRaise]::SetForegroundWindow($handle)
+  [void][DshRaise]::Raise($process.MainWindowHandle)
 }
 `
 
