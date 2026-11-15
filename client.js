@@ -1,12 +1,12 @@
 /**
  * Screenshot-to-draft plugin, Client half.
  *
- * Adds a screenshot button beside the composer's `+` control. The button asks
- * the Host to run a desktop-wide region selector, then hands the returned crop
- * to the composer as if the user had pasted an image: the composer has no
- * public "add this File" call for sibling plugins, while its document-level
- * paste route is exactly the door a real Ctrl+V uses, caps and busy refusal
- * included.
+ * Registers a 「截图提问」 row in the composer `+` menu (the command menu shared
+ * with a typed `/`). The row asks the Host to run a desktop-wide selector with
+ * the WeChat-style annotator, then hands the returned crop to the composer as
+ * if the user had pasted an image: the composer has no public "add this File"
+ * call for sibling plugins, while its document-level paste route is exactly the
+ * door a real Ctrl+V uses, caps and busy refusal included.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-screenshot',
@@ -28,6 +28,7 @@ window.__ModuleLoader__.load({
       captureFailed: 'Could not capture the screen: {error}',
       attachFailed: 'Could not attach the image: {error}',
       attachRefused: 'The composer did not take the image; it may be sending a message right now',
+      alreadyOpen: 'Another selection window is already open',
       retry: 'Retry',
       close: 'Close',
     }
@@ -39,6 +40,7 @@ window.__ModuleLoader__.load({
       captureFailed: '截屏失败：{error}',
       attachFailed: '添加图片失败：{error}',
       attachRefused: '输入框没有接收这张图片，可能正在发送消息',
+      alreadyOpen: '已经有一个截图窗口打开了',
       retry: '重试',
       close: '关闭',
     }
@@ -142,8 +144,9 @@ window.__ModuleLoader__.load({
           return deliver(file)
         },
         start() {
-          if (state.phase === 'capturing') return
+          if (state.phase === 'capturing') return false
           publish({ open: false, phase: 'capturing', error: undefined })
+          return true
         },
         close() { publish({ open: false, phase: 'idle', error: undefined }) },
         fail(error) { publish({ open: true, phase: 'failed', error }) },
@@ -184,9 +187,9 @@ window.__ModuleLoader__.load({
      * @param surface - this Session's surface.
      */
     async function run(surface) {
-      surface.start()
+      if (!surface.start()) return
       try {
-        const body = await post('screenshot/capture', { lang: localeId() })
+        const body = await post('screenshot/v6/capture', { lang: localeId() })
         const blob = await (await fetch(body.image)).blob()
         const stamp = new Date()
         const pad = (value) => String(value).padStart(2, '0')
@@ -197,6 +200,7 @@ window.__ModuleLoader__.load({
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         if (message === 'cancelled') surface.close()
+        else if (message === 'a selection is already open') surface.fail(fallbackTranslate('alreadyOpen'))
         else surface.fail(message)
       }
     }
