@@ -29,7 +29,7 @@ export const inject = ['webServer']
 
 const EDITOR_FILE = fileURLToPath(new URL('./editor.cs', import.meta.url))
 const HEADER = 'x-dsh-screenshot'
-const ROUTE_PREFIX = '/screenshot/v6'
+const ROUTE_PREFIX = '/screenshot/v7'
 const SELECT_TIMEOUT_MS = 600000
 const LOG_PATH = join(tmpdir(), 'dsh-screenshot.log')
 
@@ -83,6 +83,8 @@ $MetaPath = [string]$config.meta
 $FullPath = [string]$config.full
 $EditorPath = [string]$config.editor
 $SelfTestRect = [string]$config.selfTest
+$Scroll = [bool]$config.scroll
+$Lang = [string]$config.lang
 $StartedPath = [string]$config.started
 $EditorLog = [string]$config.log
 $Hint = [string]$config.hint
@@ -133,15 +135,15 @@ $selfTestEditor = ($SelfTestRect -ne '')
 if ($EditorLog -ne '') { $env:DSH_EDITOR_LOG = $EditorLog }
 if ($Hint -ne '') { $env:DSH_EDITOR_HINT = $Hint }
 try { Add-Content -LiteralPath $EditorLog -Value ('ps: editor.cs ' + (Get-Item -LiteralPath $EditorPath).Length + ' bytes, sel=' + $SelfTestRect) } catch { }
-$result = [DshShot.Editor]::Run($FullPath, $px, $py, $pw, $ph, $OutPath, $selfTestEditor)
+$result = [DshShot.Editor]::Run($FullPath, $px, $py, $pw, $ph, $OutPath, $selfTestEditor, $Scroll, $Lang)
 
-if ($result.Action -eq 'insert' -and (Test-Path $OutPath)) {
+if (($result.Action -eq 'insert' -or $result.Action -eq 'scroll') -and (Test-Path $OutPath)) {
   $png = [System.IO.File]::ReadAllBytes($OutPath)
   $img = [System.Drawing.Image]::FromStream((New-Object System.IO.MemoryStream (,$png)))
   $w = $img.Width
   $h = $img.Height
   $img.Dispose()
-  Write-Meta @{ ok = $true; action = 'insert'; width = $w; height = $h }
+  Write-Meta @{ ok = $true; action = $result.Action; width = $w; height = $h }
 } else {
   Write-Meta @{ ok = $false; cancelled = $true; action = $result.Action }
 }
@@ -184,7 +186,7 @@ function run(command, args, timeoutMs) {
  * @param selfTestRect - optional "x,y,w,h" that skips the interaction.
  * @returns image data URL plus pixel size.
  */
-async function selectRegion(locale, selfTestRect, keep = false) {
+async function selectRegion(locale, selfTestRect, keep = false, scroll = false) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-screenshot-'))
   const scriptPath = join(dir, 'select.ps1')
   const editorPath = join(dir, 'editor.cs')
@@ -206,6 +208,7 @@ async function selectRegion(locale, selfTestRect, keep = false) {
       editor: editorPath,
       hint: hintFor(locale),
       lang: locale.toLowerCase().startsWith('zh') ? 'zh' : 'en',
+      scroll,
       selfTest: selfTestRect ?? '',
       started: startedPath,
       log: editorLogPath,
@@ -255,11 +258,11 @@ async function selectRegion(locale, selfTestRect, keep = false) {
 }
 
 /** Platform entry: Windows today, a clear refusal elsewhere. */
-async function capture(locale, selfTestRect, keep = false) {
+async function capture(locale, selfTestRect, keep = false, scroll = false) {
   if (process.platform !== 'win32') {
     throw new Error(`screen capture is not implemented on ${process.platform} yet`)
   }
-  return await selectRegion(locale, selfTestRect, keep)
+  return await selectRegion(locale, selfTestRect, keep, scroll)
 }
 
 /** Write one JSON response. */
@@ -351,12 +354,14 @@ export function apply(ctx) {
     const locale = url.searchParams.get('lang') ?? 'en'
     const selfTest = url.searchParams.get('selftest') === '1' ? '120,160,600,360' : ''
     const keep = url.searchParams.get('keep') === '1'
+    const scroll = url.searchParams.get('mode') === 'scroll'
     busy = true
     const started = Date.now()
     try {
-      const shot = await capture(locale, selfTest, keep)
-      journal(`capture ok ${String(shot.width)}x${String(shot.height)} in ${String(Date.now() - started)}ms`)
-      sendJson(response, 200, { ok: true, ...shot })
+      const shot = await capture(locale, selfTest, keep, scroll)
+      const mode = shot.action === 'scroll' ? 'scroll' : (scroll ? 'scroll' : 'plain')
+      journal(`${mode === 'scroll' ? 'scroll' : 'capture'} ok ${String(shot.width)}x${String(shot.height)} in ${String(Date.now() - started)}ms`)
+      sendJson(response, 200, { ok: true, mode, ...shot })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       journal(`capture failed after ${String(Date.now() - started)}ms: ${message}`)
