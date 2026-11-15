@@ -1,44 +1,52 @@
 # dsh-screenshot
 
-在对话输入框左下角的 `+` 菜单里加一行 **截图提问**：点一下就能在整个桌面上自由框选区域（DSH 窗口不隐藏、不最小化，就显示在冻结画面里），松手后按原始分辨率裁切成 PNG，作为附件放进当前输入框，可以接着打字一起发送。
+在对话输入框的 `+` 菜单里加一行 **截图提问**：点一下就能在整个桌面上选窗口或框选区域（DSH 窗口不隐藏、不最小化），然后在同一个窗口里像微信截图那样加标注（矩形、椭圆、直线、箭头、画笔、马赛克、文字），最后 **插入对话** / **复制** / **另存为**。
 
-## 功能
+## 使用
 
-- `+` 菜单里多一行 **截图提问**。
-- 点击后桌面被「冻结」成一张覆盖全部显示器的截图，并在这张画面上直接弹出无边框、置顶的选区窗口：不闪烁，不隐藏、不最小化任何窗口，DSH 保持原样。
-- 按住鼠标拖动框选，选区旁实时显示像素尺寸；拖动时选区之外才变暗。
-- 松手即按原始分辨率裁切成 PNG，通过与「Ctrl+V 贴图」完全相同的通道进入输入框（附件上限、发送中拒绝、上传暂存等规则都由 composer 把关）。
-- **右键** 或 **Esc** 取消，不产生任何附件。
+1. 打开输入框的 `+`，点 **截图提问**（在「命令」分组末尾，位于「导出」之后）。
+2. 桌面被「冻结」成一张覆盖全部显示器的截图，DSH 就在这张图里，保持原样。此时：
+   - **鼠标所在窗口**被保留、其余区域整片压暗，并给该窗口描一圈绿色边框（微信同款）；
+   - **左键单击**：把高亮的整个窗口作为选区；
+   - **按住左键拖动**：自己框选——**拖动过程中选区实时保持高亮、选区之外同步压暗**，选区上沿跟着显示 `宽 x 高` 像素尺寸，松开即确定；
+   - **右键 / Esc**：取消。
+3. 选区确定后**同一个窗口**直接变成标注界面：选区四边与四角各有控制点，可继续拉伸/裁剪；不选工具时在选区内按住可整体移动选区。
 
-## 安装
+   | 工具 | 说明 |
+   | --- | --- |
+   | 矩形 / 椭圆 | 按住左键拖出图形 |
+   | 直线 | 从按下点画到松开点 |
+   | 箭头 | 按下点是箭尾、松开点是箭尖，**任意方向**都成立 |
+   | 画笔 | 自由手绘线条 |
+   | 马赛克 | 拖出矩形，该区域被像素化 |
+   | 文字 | 在画面上点一下就地输入，Enter 确认，Esc 放弃 |
 
-```bash
-dsh plugin install dsh-screenshot
-```
+   工具条是一整排**白色**圆角底、右对齐选区：`矩形 椭圆 直线 箭头 画笔 马赛克 文字 ｜ 撤销 重做 ｜ 复制 另存为 ｜ ✕ 取消 ✓ 插入`；当前工具浅蓝底、蓝色图标。
 
-或在 profile 的 `dsh.profile.bundles` 里加入 `dsh-screenshot`，由 loader 拉取。截屏实现依赖 **Windows**（PowerShell + WinForms）；其他平台该行不显示。
+   - **颜色 / 大小默认不显示**：点过 矩形 / 椭圆 / 直线 / 箭头 / 文字 之后（或选中这类图形时）才在工具条下方浮出第二排。画笔与图形用粗细（2 / 4 / 8 px）；**文字用字号，标成「小 / 中 / 大」（18 / 28 / 44 px）**；改色、改大小直接作用在选中的对象上。
+   - **画完还能改**：图形画完即处于选中状态（蓝色虚线框 + 控制点）；拖控制点改大小，直线/箭头拖端点改长度方向，图形内拖动平移，`Delete` 删除，再点一次工具按钮继续画下一个。
+   - **撤销 / 重做**：`Ctrl+Z` / `Ctrl+Y`（或 `Ctrl+Shift+Z`），按钮在没有可执行内容时置灰。`Ctrl+A` 整屏为选区。
+   - **✓ 插入对话**：标注后的图片作为附件进入当前输入框，可继续写字一起发送。
+   - **复制**：整张标注图进剪贴板。**另存为**：PNG / JPEG / BMP。
+   - **✕ 取消**：放弃本次截图；`Esc` 依次是「取消选中 → 退出当前工具 → 退出选区 → 取消截图」。
+4. 图片进入输入框后与手动粘贴的图片走同一条通道，附件数量/体积上限、发送中拒绝等规则都由 composer 判断。
 
 ## 实现
 
-- **Host 半（`index.js`）**：注册 `POST /screenshot/capture`（要求 `x-dsh-screenshot: 1` 头且同源）与 `GET /screenshot/status`。截图由一段 PowerShell 脚本完成：先声明 per-monitor DPI 感知，抓取整个虚拟屏幕（`SystemInformation.VirtualScreen`，含多显示器）作为「冻结帧」，再用无边框置顶的 WinForms 窗口覆盖桌面显示这张帧，拖动时把选区之外变暗，右键 / Esc 视为取消，最后从冻结位图上按原始分辨率裁切，并通过 stdout 的 JSON 把结果交回 Host。页面自身无法截屏——Electron 会话禁止 display media 且拦截 http(s) 子资源——所以像素只能由 Host 进程提供。
-- **Client 半（`client.js`）**：注册一个 `ctx.commandUi` 贡献（即菜单里那一行）和一个 `conversation.input.overlay` 条目（失败时的小卡片，带重试）。拿到 PNG 后先尝试 `inputActions.addFiles`，否则向文档派发一次合成的 `ClipboardEvent('paste')`（携带 `DataTransfer`），走 composer 自己的文档级粘贴入口。
+- **Host 半（`index.js`）**：注册 `POST /screenshot/v6/capture`（要求 `x-dsh-screenshot: 1` 且同源）与 `GET /screenshot/v6/status`。PowerShell 只负责三件事：声明 per-monitor DPI 感知、把整个虚拟屏幕抓成 `full.png`、编译并运行 `editor.cs`；最终以 base64 data URL 把标注后的图返回页面。
+- **编辑器（`editor.cs`）**：随包发布的 C# 5 源码，抓图时用 `Add-Type` 现场编译。一个无边框、置顶、覆盖所有显示器的 WinForms 窗口同时承担「选」和「标」：`EnumWindows` + `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` 找光标下窗口、拖动中实时重算选区并压暗其外、GDI+ 手绘图标与工具条、`Compose()` 按原始分辨率合成输出。
+- **启动方式**：由 Host 直接 `spawn` PowerShell 并等待结束（`-STA` 必需）。`explorer`/`wscript` 之类的绕行链路会把窗口开到不可见桌面上，不要改成那种方式。
+- **Client 半（`client.js`）**：注册 `+` 菜单的命令行（`ctx.commandUi.register`，名字 `screenshot`），并在 `conversation.input.overlay` 上挂一个只在失败时出现的提示卡片（可重试）。拿到 PNG 后先尝试 `inputActions.addFiles`，否则派发合成粘贴事件，交回 composer 的文档级粘贴入口。
+- 排查用日志：`%TEMP%\dsh-screenshot.log`（`capture ok 宽x高 in 毫秒`）与 `%TEMP%\dsh-screenshot-editor.log`（hover、`finish 动作`）。
 
-每次截图都会写一行日志到 `%TEMP%\dsh-screenshot.log`（`capture ok <w>x<h> in <ms>`），点下去没反应时先看这里。
+## 为什么不是「添加」分组里的一行
 
-## 为什么这一行排在「命令」分组末尾
+`+` 菜单的分组由 `@deepseek-ai/dsh-client-ui-commands` 的 `SECTION_ROWS` 写死：只有 `file / goal / plan / feedback` 会进「添加」，其余一律排在「命令」分组末尾；插件贡献的命令名与内置命令重名会在注册时报错。所以这一行固定在「命令」分组最后。
 
-`+` 菜单的分组在 `@deepseek-ai/dsh-client-ui-commands` 里写死：
+## 平台
 
-```ts
-const SECTION_ROWS = { add: ['file', 'goal', 'plan', 'feedback'], commands: ['compact', 'permission', 'model', 'export'] }
-```
-
-只有这四个命令名会进「添加」分组；其余（包括插件贡献）一律排在「命令」分组末尾。占用「添加」里的名字也不可能：与内置命令重名会在菜单构建时直接抛错（`ui-commands: contribution /<name> collides with a host command`）。所以插件自己的行只能落在「命令」分组，本插件就是如此。
+截屏与标注目前只在 **Windows** 上实现；其他平台 `GET /screenshot/v6/status` 返回 `supported: false`，浏览器页面（非桌面端）里这一行不出现。
 
 ## 卸载
 
-```bash
-dsh plugin remove dsh-screenshot
-```
-
-它只增加一行菜单、一个覆盖层条目和两个 Host 路由，不动其他任何东西。
+在插件管理里移除 `dsh-screenshot` 即可；它只注册一个菜单命令、一个提示卡片插槽和两个 Host 路由。
