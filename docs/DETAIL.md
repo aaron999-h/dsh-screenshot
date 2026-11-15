@@ -7,7 +7,7 @@ dsh-screenshot/
   package.json        dsh.bundle.patch + dsh.client (web, immediately)
   cordis.patch.yml    inserts the loader entry `dsh-screenshot`
   index.js            Host half: the HTTP routes, the frozen-frame script, the work dir
-  client.js           Client half: the `+` menu row and the failure card
+  client.js           Client half: the `+` menu row, the Alt+A binding, the failure card
   editor.cs           The whole selection + annotation window (C# 5, compiled at capture time)
   locale/{en,zh}.json marketplace metadata
   assets/icon.svg     icon (also shipped as a 180 px PNG in the release)
@@ -20,7 +20,7 @@ dsh-screenshot/
    contribution's `ui.kind === 'action'` callback with the session context, so
    the row consumes its own trigger token and never blocks a draft that already
    carries an attachment.
-2. The client posts to `screenshot/v6/capture?lang=<locale>` on the same origin
+2. The client posts to `screenshot/v7/capture?lang=<locale>` on the same origin
    (`document.baseURI`), with the `x-dsh-screenshot: 1` header.
 3. The Host serialises the request (`busy` latch), creates a fresh
    `%TEMP%\dsh-screenshot-*` directory, copies `editor.cs` into it and writes
@@ -52,6 +52,31 @@ dsh-screenshot/
    `inputActions.addFiles` when the shell projects it, otherwise through a
    synthetic `ClipboardEvent('paste')` carrying a `DataTransfer`, which the
    composer's document-level paste intake picks up exactly like a real Ctrl+V.
+
+## The global Alt+A hotkey
+
+The in-window key comes from `ctx.shortcuts`, which is bound to the window and
+therefore dead while DSH is minimized — and a Host plugin cannot call Electron's
+`globalShortcut` (`dsh-api-remotes` also exposes no custom host→client event, so
+there is no push channel to build one from). Instead the Host keeps a long-lived
+helper:
+
+- `startHotkey()` writes `dsh-screenshot-hotkey.cs`, a `.ps1` wrapper and the
+  raise script into `%TEMP%`, then spawns one `powershell.exe` that compiles the
+  C# **in memory** (`Add-Type -TypeDefinition`) and loops on
+  `RegisterHotKey(NULL, id, MOD_ALT, VK_A)` + `PeekMessage`. Compiling to disk and
+  launching an `.exe` is blocked by the machine's Application Control policy, so
+  the hotkey has to live inside an already-running interpreter.
+- Each press writes `%TEMP%\dsh-screenshot-hotkey.signal`, which the Host polls
+  every 300 ms; `RegisterHotKey` failures are reported through
+  `<signal>.error` and journaled as `hotkey unavailable: register-failed <code>`.
+- The capture is parked in `pendingShot` and served by
+  `GET screenshot/v7/pending`; the page claims it with
+  `POST screenshot/v7/pending/ack` after the draft accepted the file (a refusal
+  leaves it parked, so nothing is lost).
+- After the capture the Host runs the raise script (`ShowWindow(SW_RESTORE)` +
+  `SetForegroundWindow`), because a minimized window has to be restored before
+  the composer can show the attachment.
 
 ## Why the pixels come from the Host
 
