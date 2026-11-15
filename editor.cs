@@ -11,7 +11,7 @@ namespace DshShot
 {
     public enum ToolKind { None, Rect, Ellipse, Line, Arrow, Pen, Mosaic, Text }
 
-    public enum BtnKind { Rect, Ellipse, Line, Arrow, Pen, Mosaic, Text, Undo, Redo, Copy, Save, Cancel, Confirm }
+    public enum BtnKind { Rect, Ellipse, Line, Arrow, Pen, Mosaic, Text, Scroll, Undo, Redo, Copy, Save, Cancel, Confirm }
 
     public class Op
     {
@@ -72,12 +72,19 @@ namespace DshShot
         /* ---------------------------------------------------------------- *
          * State
          * ---------------------------------------------------------------- */
-        readonly Bitmap full;
+        Bitmap full;
         readonly string outPath;
         readonly bool selfTest;
 
         Rectangle sel;
         bool hasSel;
+
+        // After a scrolling capture the stitched image is taller than the
+        // screen, so it stays in the same window scaled to fit; annotations are
+        // kept in image coordinates and Map() converts the mouse input.
+        bool resultMode;
+        float resultScale = 1f;
+        Rectangle resultRect;
 
         Rectangle hover;
         bool hasHover;
@@ -137,12 +144,16 @@ namespace DshShot
 
         Timer tick;
         Result result;
+        readonly bool scrollMode;
+        readonly string language;
 
-        public EditorForm(Bitmap full, Rectangle preset, string outPath, bool selfTest)
+        public EditorForm(Bitmap full, Rectangle preset, string outPath, bool selfTest, bool scrollMode, string language)
         {
             this.full = full;
             this.outPath = outPath;
             this.selfTest = selfTest;
+            this.scrollMode = scrollMode;
+            this.language = language;
 
             sel = preset.Width > 8 ? Rectangle.Intersect(preset, new Rectangle(0, 0, full.Width, full.Height)) : Rectangle.Empty;
             hasSel = sel.Width > 8 && sel.Height > 8;
@@ -164,6 +175,7 @@ namespace DshShot
             buttons.Add(BtnKind.Pen);
             buttons.Add(BtnKind.Mosaic);
             buttons.Add(BtnKind.Text);
+            buttons.Add(BtnKind.Scroll);
             buttons.Add(BtnKind.Undo);
             buttons.Add(BtnKind.Redo);
             buttons.Add(BtnKind.Copy);
@@ -220,6 +232,7 @@ namespace DshShot
             {
                 BtnKind kind = buttons[i];
                 bool newGroup =
+                    (kind == BtnKind.Scroll) ||
                     (kind == BtnKind.Undo) ||
                     (kind == BtnKind.Copy) ||
                     (kind == BtnKind.Cancel);
@@ -236,13 +249,16 @@ namespace DshShot
             int height = size + pad * 2;
 
             Rectangle screen = SystemInformation.VirtualScreen;
-            int right = hasSel ? sel.Right : (screen.Left + screen.Width);
+            Rectangle anchor = hasSel ? sel : new Rectangle(screen.Left, screen.Top, screen.Width, screen.Height);
+            if (resultMode) anchor = resultRect;
+            int right = anchor.Right;
             int left = right - width;
             if (left + width > screen.Right - 8) left = screen.Right - 8 - width;
             if (left < screen.Left + 8) left = screen.Left + 8;
 
-            int top = hasSel ? sel.Bottom + 8 : screen.Bottom - height - 40;
-            if (top + height > screen.Bottom - 8) top = (hasSel ? sel.Top : screen.Bottom) - 8 - height;
+            int top = anchor.Bottom + 8;
+            if (!hasSel && !resultMode) top = screen.Bottom - height - 40;
+            if (top + height > screen.Bottom - 8) top = anchor.Top - 8 - height;
             if (top < screen.Top + 8) top = screen.Top + 8;
 
             panel = new Rectangle(left, top, width, height);
@@ -335,6 +351,13 @@ namespace DshShot
             Graphics g = e.Graphics;
             g.InterpolationMode = InterpolationMode.NearestNeighbor;
             g.PixelOffsetMode = PixelOffsetMode.Half;
+
+            if (resultMode)
+            {
+                PaintResult(g);
+                return;
+            }
+
             g.DrawImage(full, 0, 0);
 
             if (!hasSel)
@@ -750,6 +773,7 @@ namespace DshShot
         {
             if (kind == BtnKind.Undo) return ops.Count > 0;
             if (kind == BtnKind.Redo) return redo.Count > 0;
+            if (kind == BtnKind.Scroll) return hasSel && !resultMode;
             return true;
         }
 
@@ -836,6 +860,15 @@ namespace DshShot
                         g.DrawLine(pen, cx, cy + 2, cx + 4, cy - 2);
                         g.DrawLine(pen, cx - 7, cy + 7, cx + 7, cy + 7);
                         break;
+                    case BtnKind.Scroll:
+                        g.DrawRectangle(pen, cx - 8.6f, cy - 7.4f, 6.4f, 14.8f);
+                        g.DrawLine(pen, cx - 6.8f, cy - 4.6f, cx - 4.2f, cy - 4.6f);
+                        g.DrawLine(pen, cx - 6.8f, cy - 1.8f, cx - 4.2f, cy - 1.8f);
+                        g.DrawLine(pen, cx - 6.8f, cy + 1.0f, cx - 4.2f, cy + 1.0f);
+                        g.DrawLine(pen, cx + 3.4f, cy - 7.0f, cx + 3.4f, cy + 4.0f);
+                        g.DrawLine(pen, cx + 3.4f, cy + 4.0f, cx + 1.2f, cy + 1.4f);
+                        g.DrawLine(pen, cx + 3.4f, cy + 4.0f, cx + 5.6f, cy + 1.4f);
+                        break;
                     case BtnKind.Cancel:
                         g.DrawLine(pen, cx - 5, cy - 5, cx + 5, cy + 5);
                         g.DrawLine(pen, cx + 5, cy - 5, cx - 5, cy + 5);
@@ -857,6 +890,40 @@ namespace DshShot
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+
+            if (resultMode)
+            {
+                if (dragging)
+                {
+                    PointF current = Map(e.Location);
+                    Point probe = Point.Round(current);
+                    if (pending != null)
+                    {
+                        pending.End = current;
+                        if (pending.Kind == ToolKind.Pen) pending.Points.Add(current);
+                        else pending.Rect = Normalize(Point.Round(dragStart), probe);
+                    }
+                    else if (handleIndex >= 0 && selected != null)
+                    {
+                        DragHandle(selected, handleIndex, probe);
+                    }
+                    else if (moving && selected != null)
+                    {
+                        MoveOp(selected, new Point(probe.X - dragStart.X, probe.Y - dragStart.Y), dragStart);
+                    }
+                    Invalidate();
+                    return;
+                }
+                int hovered = -1;
+                for (int i = 0; i < buttonRects.Count; i++)
+                    if (buttonRects[i].Contains(e.Location) && IsEnabled(buttons[i])) hovered = i;
+                if (hovered != hoverIndex) { hoverIndex = hovered; Invalidate(); }
+                Cursor = Cursors.Default;
+                if (tool != ToolKind.None) Cursor = Cursors.Cross;
+                else if (selected != null && HandleAt(selected, Point.Round(Map(e.Location)), 7f / Math.Max(0.2f, resultScale)) >= 0)
+                    Cursor = Cursors.SizeAll;
+                return;
+            }
 
             if (!hasSel)
             {
@@ -890,7 +957,7 @@ namespace DshShot
             {
                 if (selecting)
                 {
-                    sel = Normalize(dragStart, e.Location);
+                    sel = Clip(Normalize(dragStart, e.Location));
                     Recalculate();
                 }
                 else if (moving && selected != null)
@@ -918,9 +985,10 @@ namespace DshShot
                 }
                 else if (pending != null)
                 {
-                    pending.End = e.Location;
-                    if (pending.Kind == ToolKind.Pen) pending.Points.Add(e.Location);
-                    else pending.Rect = Normalize(dragStart, e.Location);
+                    PointF current = Map(e.Location);
+                    pending.End = current;
+                    if (pending.Kind == ToolKind.Pen) pending.Points.Add(current);
+                    else pending.Rect = Normalize(Point.Round(dragStart), Point.Round(current));
                 }
                 Invalidate();
                 return;
@@ -982,10 +1050,15 @@ namespace DshShot
 
         int HandleAt(Op op, Point point)
         {
+            return HandleAt(op, point, 7f);
+        }
+
+        int HandleAt(Op op, Point point, float tolerance)
+        {
             List<Point> handles = OpHandlePoints(op);
             for (int i = 0; i < handles.Count; i++)
             {
-                if (Math.Abs(handles[i].X - point.X) <= 7 && Math.Abs(handles[i].Y - point.Y) <= 7) return i;
+                if (Math.Abs(handles[i].X - point.X) <= tolerance && Math.Abs(handles[i].Y - point.Y) <= tolerance) return i;
             }
             return -1;
         }
@@ -1067,6 +1140,53 @@ namespace DshShot
                 }
             }
 
+            if (resultMode)
+            {
+                PointF image = Map(e.Location);
+                Point probe = Point.Round(image);
+                if (tool == ToolKind.None)
+                {
+                    if (selected != null)
+                    {
+                        int grab = HandleAt(selected, probe, 7f / Math.Max(0.2f, resultScale));
+                        if (grab >= 0)
+                        {
+                            handleIndex = grab;
+                            dragging = true;
+                            moving = false;
+                            Invalidate();
+                            return;
+                        }
+                    }
+                    Op target = HitOp(probe);
+                    if (target != null)
+                    {
+                        selected = target;
+                        moving = true;
+                        dragging = true;
+                        CaptureMove(target, probe);
+                    }
+                    else
+                    {
+                        selected = null;
+                    }
+                    Invalidate();
+                    return;
+                }
+                if (tool == ToolKind.Text) { BeginText(Point.Round(image)); return; }
+                dragging = true;
+                dragStart = Point.Round(image);
+                pending = new Op();
+                pending.Kind = tool;
+                pending.Color = color;
+                pending.Width = strokeWidth;
+                pending.Start = image;
+                pending.End = image;
+                if (tool == ToolKind.Pen) pending.Points.Add(image);
+                Invalidate();
+                return;
+            }
+
             if (!hasSel)
             {
                 // A plain click (no drag) takes the window that was highlighted
@@ -1132,7 +1252,7 @@ namespace DshShot
 
             if (hitZone != Zone.Inside) return;
 
-            if (tool == ToolKind.Text) { BeginText(e.Location); return; }
+            if (tool == ToolKind.Text) { BeginText(Point.Round(Map(e.Location))); return; }
 
             zone = Zone.None;
             dragging = true;
@@ -1141,9 +1261,9 @@ namespace DshShot
             pending.Kind = tool;
             pending.Color = color;
             pending.Width = strokeWidth;
-            pending.Start = e.Location;
-            pending.End = e.Location;
-            if (tool == ToolKind.Pen) pending.Points.Add(e.Location);
+            pending.Start = Map(e.Location);
+            pending.End = Map(e.Location);
+            if (tool == ToolKind.Pen) pending.Points.Add(Map(e.Location));
             Invalidate();
         }
 
@@ -1177,6 +1297,11 @@ namespace DshShot
                     hasSel = sel.Width > 8 && sel.Height > 8;
                 }
                 clickHover = null;
+                if (hasSel && scrollMode)
+                {
+                    StartScroll();
+                    return;
+                }
                 if (hasSel) Recalculate();
                 Invalidate();
                 return;
@@ -1364,6 +1489,7 @@ namespace DshShot
                 case BtnKind.Pen: Toggle(ToolKind.Pen); break;
                 case BtnKind.Mosaic: Toggle(ToolKind.Mosaic); break;
                 case BtnKind.Text: Toggle(ToolKind.Text); break;
+                case BtnKind.Scroll: StartScroll(); return;
                 case BtnKind.Undo: Undo(); return;
                 case BtnKind.Redo: Redo(); return;
                 case BtnKind.Copy: Finish("copy"); return;
@@ -1450,6 +1576,110 @@ namespace DshShot
         }
 
         /* ---------------------------------------------------------------- *
+         * Result view (stitched scrolling capture)
+         * ---------------------------------------------------------------- */
+        void EnterResult(Bitmap stitched)
+        {
+            full = stitched;
+            ops.Clear();
+            redo.Clear();
+            selected = null;
+            pending = null;
+            tool = ToolKind.None;
+            resultMode = true;
+            sel = new Rectangle(0, 0, stitched.Width, stitched.Height);
+            hasSel = true;
+            hasHover = false;
+            hover = Rectangle.Empty;
+            Cursor = Cursors.Default;
+            Show();
+            Activate();
+            // The client size is only meaningful once the window is shown again.
+            FitResult();
+            Recalculate();
+            Invalidate();
+            Log("result image " + stitched.Width + "x" + stitched.Height + " scale=" + resultScale);
+        }
+
+        void FitResult()
+        {
+            if (!resultMode)
+            {
+                resultScale = 1f;
+                resultRect = new Rectangle(0, 0, full.Width, full.Height);
+                return;
+            }
+            int availableWidth = Math.Max(160, ClientSize.Width - 96);
+            int availableHeight = Math.Max(160, ClientSize.Height - 170);
+            float scale = Math.Min(1f, Math.Min((float)availableWidth / full.Width, (float)availableHeight / full.Height));
+            if (scale <= 0f || float.IsNaN(scale)) scale = 1f;
+            resultScale = scale;
+            int width = Math.Max(1, (int)Math.Round(full.Width * scale));
+            int height = Math.Max(1, (int)Math.Round(full.Height * scale));
+            int left = (ClientSize.Width - width) / 2;
+            int top = Math.Max(16, (ClientSize.Height - height) / 2 - 24);
+            resultRect = new Rectangle(left, top, width, height);
+        }
+
+        PointF Map(PointF point)
+        {
+            if (!resultMode) return point;
+            return new PointF(
+                (point.X - resultRect.Left) / resultScale,
+                (point.Y - resultRect.Top) / resultScale);
+        }
+
+        void PaintResult(Graphics g)
+        {
+            using (SolidBrush dim = new SolidBrush(Color.FromArgb(168, 0, 0, 0)))
+                g.FillRectangle(dim, ClientRectangle);
+
+            Rectangle target = resultRect;
+            g.DrawImage(full, target);
+
+            GraphicsState state = g.Save();
+            g.SetClip(target);
+            g.TranslateTransform(target.Left, target.Top);
+            g.ScaleTransform(resultScale, resultScale);
+            foreach (Op op in ops) DrawOne(g, op);
+            if (pending != null) DrawOne(g, pending);
+            g.Restore(state);
+
+            if (selected != null)
+            {
+                RectangleF box = OpBounds(selected);
+                RectangleF onScreen = new RectangleF(
+                    target.Left + box.X * resultScale,
+                    target.Top + box.Y * resultScale,
+                    box.Width * resultScale,
+                    box.Height * resultScale);
+                using (Pen pen = new Pen(Color.FromArgb(220, Accent), 1.4f))
+                {
+                    pen.DashStyle = DashStyle.Dash;
+                    g.DrawRectangle(pen, onScreen.X, onScreen.Y, onScreen.Width, onScreen.Height);
+                }
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                foreach (Point handle in OpHandlePoints(selected))
+                {
+                    float hx = target.Left + handle.X * resultScale;
+                    float hy = target.Top + handle.Y * resultScale;
+                    using (SolidBrush white = new SolidBrush(Color.White))
+                    using (Pen ring = new Pen(Accent, 1.2f))
+                    {
+                        g.FillRectangle(white, hx - 4f, hy - 4f, 8f, 8f);
+                        g.DrawRectangle(ring, hx - 4f, hy - 4f, 8f, 8f);
+                    }
+                }
+            }
+
+            using (Pen border = new Pen(Color.FromArgb(200, 255, 255, 255), 1f))
+                g.DrawRectangle(border, target);
+
+            DrawPanel(g);
+            DrawPalette(g);
+        }
+
+        /* ---------------------------------------------------------------- *
          * Output
          * ---------------------------------------------------------------- */
         Bitmap Compose()
@@ -1529,6 +1759,37 @@ namespace DshShot
             }
         }
 
+        /* ---------------------------------------------------------------- *
+         * Scrolling capture
+         * ---------------------------------------------------------------- */
+        void StartScroll()
+        {
+            Rectangle area = sel;
+            bool zh = string.IsNullOrEmpty(language) || language.StartsWith("zh");
+            Log("scroll start area=" + area);
+            Hide();
+            Bitmap stitched = null;
+            try
+            {
+                stitched = ScrollCapture.Run(area, zh);
+            }
+            catch (Exception error)
+            {
+                Log("scroll failed " + error.Message);
+            }
+            if (stitched == null)
+            {
+                // Cancelled: come back to the pick / annotation view untouched.
+                Log("scroll cancelled");
+                Show();
+                Activate();
+                Invalidate();
+                return;
+            }
+            Log("scroll done size=" + stitched.Width + "x" + stitched.Height);
+            EnterResult(stitched);
+        }
+
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
@@ -1587,6 +1848,52 @@ namespace DshShot
                 selecting = true;
                 dragging = true;
                 sel = Normalize(dragStart, new Point(1460, 860));
+                Invalidate();
+            }
+            if (Environment.GetEnvironmentVariable("DSH_EDITOR_RESULT") == "1")
+            {
+                // Diagnostic: fabricate a stitched page and show the result view.
+                Bitmap fake = new Bitmap(720, 2600);
+                using (Graphics g = Graphics.FromImage(fake))
+                {
+                    g.Clear(Color.White);
+                    for (int y = 0; y < fake.Height; y += 90)
+                    {
+                        using (SolidBrush brush = new SolidBrush(Color.FromArgb(255, (y * 7) % 255, (y * 13) % 255, (y * 29) % 255)))
+                            g.FillRectangle(brush, 20, y, fake.Width - 40, 40);
+                    }
+                    using (Font font = new Font("Microsoft YaHei UI", 14f))
+                    {
+                        for (int y = 8; y < fake.Height; y += 180) g.DrawString("stitched row " + y, font, Brushes.Black, 26, y + 44);
+                    }
+                }
+                EnterResult(fake);
+                Op demo = new Op
+                {
+                    Kind = ToolKind.Rect,
+                    Rect = new RectangleF(60, 120, 380, 260),
+                    Color = Palette[0],
+                    Width = 6f
+                };
+                ops.Add(demo);
+                ops.Add(new Op
+                {
+                    Kind = ToolKind.Arrow,
+                    Start = new PointF(120, 900),
+                    End = new PointF(600, 520),
+                    Color = Palette[3],
+                    Width = 6f
+                });
+                selected = demo;
+                if (Environment.GetEnvironmentVariable("DSH_EDITOR_GRAB") == "1")
+                {
+                    // Diagnostic: drag the bottom-right handle in image space,
+                    // the way a mouse drag maps inside the scaled result view.
+                    handleIndex = 4;
+                    DragHandle(demo, 4, new Point(560, 620));
+                    handleIndex = -1;
+                }
+                Recalculate();
                 Invalidate();
             }
             string diag = Environment.GetEnvironmentVariable("DSH_EDITOR_DIAG");
@@ -1723,13 +2030,13 @@ namespace DshShot
         /* ---------------------------------------------------------------- *
          * Entry point
          * ---------------------------------------------------------------- */
-        public static Result Run(string fullPath, int x, int y, int w, int h, string outPath, bool selfTest)
+        public static Result Run(string fullPath, int x, int y, int w, int h, string outPath, bool selfTest, bool scrollMode, string language)
         {
             try { Application.EnableVisualStyles(); }
             catch { }
             using (Bitmap full = new Bitmap(fullPath))
             {
-                using (EditorForm form = new EditorForm(full, new Rectangle(x, y, w, h), outPath, selfTest))
+                using (EditorForm form = new EditorForm(full, new Rectangle(x, y, w, h), outPath, selfTest, scrollMode, language))
                 {
                     form.ShowDialog();
                     return form.result ?? new Result { Action = "cancel", Width = 0, Height = 0 };
@@ -1738,12 +2045,366 @@ namespace DshShot
         }
     }
 
+    /// <summary>
+    /// Scrolling capture: the selection stays fixed on screen, the user scrolls the
+    /// window underneath it, and every newly revealed slice is stitched onto the
+    /// bottom of one tall image.
+    /// </summary>
+    public static class ScrollCapture
+    {
+        public const int MaxHeight = 24000;
+        public const int TickMs = 320;
+        public const int MaxSeconds = 180;
+
+        internal static Bitmap Grab(Rectangle area)
+        {
+            Bitmap bmp = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppArgb);
+            using (Graphics g = Graphics.FromImage(bmp))
+            {
+                g.CopyFromScreen(area.Left, area.Top, 0, 0, new Size(area.Width, area.Height), CopyPixelOperation.SourceCopy);
+            }
+            return bmp;
+        }
+
+        internal static int[] Pixels(Bitmap bmp)
+        {
+            int w = bmp.Width;
+            int h = bmp.Height;
+            int[] px = new int[w * h];
+            BitmapData data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            try
+            {
+                for (int y = 0; y < h; y++)
+                {
+                    Marshal.Copy(new IntPtr(data.Scan0.ToInt64() + (long)y * data.Stride), px, y * w, w);
+                }
+            }
+            finally
+            {
+                bmp.UnlockBits(data);
+            }
+            return px;
+        }
+
+        static double Diff(int[] a, int[] b, int w, int fromA, int fromB, int rows)
+        {
+            long sum = 0;
+            int count = 0;
+            for (int y = 0; y < rows; y += 3)
+            {
+                int ia = (fromA + y) * w;
+                int ib = (fromB + y) * w;
+                for (int x = 0; x < w; x += 6)
+                {
+                    int pa = a[ia + x];
+                    int pb = b[ib + x];
+                    int dr = ((pa >> 16) & 0xFF) - ((pb >> 16) & 0xFF);
+                    int dg = ((pa >> 8) & 0xFF) - ((pb >> 8) & 0xFF);
+                    int db = (pa & 0xFF) - (pb & 0xFF);
+                    sum += Math.Abs(dr) + Math.Abs(dg) + Math.Abs(db);
+                    count++;
+                }
+            }
+            return count == 0 ? double.MaxValue : (double)sum / count;
+        }
+
+        /// <summary>0 when nothing moved, &gt;0 when the content moved up that many pixels, -1 when the frames are unrelated.</summary>
+        public static int Detect(int[] prev, int[] next, int w, int h)
+        {
+            if (Diff(prev, next, w, 0, 0, h) < 3.0) return 0;
+            int best = -1;
+            double bestScore = double.MaxValue;
+            int maxShift = h - 16;
+            for (int s = 8; s <= maxShift; s += 2)
+            {
+                int rows = Math.Min(h - s, Math.Max(48, h / 2));
+                double score = Diff(prev, next, w, s, 0, rows);
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    best = s;
+                }
+            }
+            return bestScore > 24.0 ? -1 : best;
+        }
+
+        /// <summary>Accumulates the slices of a scrolling page into one tall bitmap.</summary>
+        public sealed class Stitcher : IDisposable
+        {
+            readonly int width;
+            readonly int height;
+            readonly List<Bitmap> bands = new List<Bitmap>();
+            int[] lastPixels;
+
+            public Stitcher(Bitmap first)
+            {
+                width = first.Width;
+                height = first.Height;
+                bands.Add(first);
+                Total = height;
+                lastPixels = Pixels(first);
+            }
+
+            public int Total { get; private set; }
+
+            public int Width { get { return width; } }
+
+            /// <summary>Appends the rows the frame revealed at its bottom; returns how many (0 when nothing new).</summary>
+            public int Add(Bitmap frame)
+            {
+                if (Total >= MaxHeight) return 0;
+                int[] px = Pixels(frame);
+                int shift = Detect(lastPixels, px, width, height);
+                if (shift <= 6 || shift > height - 16 || Total + shift > MaxHeight) return 0;
+                Bitmap band = new Bitmap(width, shift, PixelFormat.Format32bppArgb);
+                using (Graphics g = Graphics.FromImage(band))
+                {
+                    g.DrawImage(frame, new Rectangle(0, 0, width, shift), new Rectangle(0, height - shift, width, shift), GraphicsUnit.Pixel);
+                }
+                bands.Add(band);
+                Total += shift;
+                lastPixels = px;
+                return shift;
+            }
+
+            public Bitmap Compose()
+            {
+                Bitmap tall = new Bitmap(width, Total, PixelFormat.Format32bppArgb);
+                using (Graphics g = Graphics.FromImage(tall))
+                {
+                    int y = 0;
+                    foreach (Bitmap band in bands)
+                    {
+                        g.DrawImageUnscaled(band, 0, y);
+                        y += band.Height;
+                    }
+                }
+                return tall;
+            }
+
+            public void Dispose()
+            {
+                foreach (Bitmap band in bands) band.Dispose();
+                bands.Clear();
+            }
+        }
+
+        /// <summary>Small always-on-top bar that must not cover the captured region.</summary>
+        sealed class Strip : Form
+        {
+            readonly Label caption;
+            readonly Timer timer;
+            int ticks;
+            bool busy;
+
+            public Action Tick;
+            public bool Finished { get; private set; }
+
+            public Strip(Rectangle area, bool zh, int total)
+            {
+                FormBorderStyle = FormBorderStyle.FixedToolWindow;
+                StartPosition = FormStartPosition.Manual;
+                TopMost = true;
+                ShowInTaskbar = false;
+                MinimizeBox = false;
+                MaximizeBox = false;
+                ClientSize = new Size(330, 96);
+                Text = zh ? "滚动截图" : "Scrolling capture";
+
+                caption = new Label();
+                caption.AutoSize = false;
+                caption.Bounds = new Rectangle(12, 10, 306, 44);
+                caption.Text = Progress(total, zh);
+                caption.ForeColor = Color.FromArgb(44, 46, 54);
+
+                Button done = new Button();
+                done.Text = zh ? "完成" : "Done";
+                done.Bounds = new Rectangle(150, 60, 80, 26);
+                done.Click += delegate { Finish(); };
+
+                Button cancel = new Button();
+                cancel.Text = zh ? "取消" : "Cancel";
+                cancel.Bounds = new Rectangle(238, 60, 80, 26);
+                cancel.Click += delegate { Finished = false; Close(); };
+
+                Controls.Add(caption);
+                Controls.Add(done);
+                Controls.Add(cancel);
+
+                Rectangle screen = SystemInformation.VirtualScreen;
+                int x = area.Left;
+                if (x + Width > screen.Right - 8) x = screen.Right - Width - 8;
+                if (x < screen.Left + 8) x = screen.Left + 8;
+                int y = area.Bottom + 10;
+                if (y + Height > screen.Bottom - 8) y = area.Top - Height - 10;
+                if (y < screen.Top + 8) y = screen.Top + 8;
+                Location = new Point(x, y);
+
+                timer = new Timer();
+                timer.Interval = TickMs;
+                timer.Tick += OnTick;
+            }
+
+            static string Progress(int total, bool zh)
+            {
+                return zh
+                    ? "在下面那个窗口里滚动，滚到底后点「完成」\n已拼接 " + total + " px"
+                    : "Scroll the window underneath, then press Done.\nStitched " + total + " px";
+            }
+
+            public void SetProgress(int total)
+            {
+                caption.Text = Progress(total, Text == "滚动截图");
+            }
+
+            void OnTick(object sender, EventArgs e)
+            {
+                if (busy) return;
+                busy = true;
+                try
+                {
+                    if (Tick != null) Tick();
+                }
+                finally
+                {
+                    busy = false;
+                }
+                ticks++;
+                if (ticks > MaxSeconds * 1000 / TickMs) Finish();
+            }
+
+            void Finish()
+            {
+                Finished = true;
+                Close();
+            }
+
+            protected override void OnShown(EventArgs e)
+            {
+                base.OnShown(e);
+                timer.Start();
+            }
+
+            protected override void OnFormClosed(FormClosedEventArgs e)
+            {
+                timer.Stop();
+                timer.Dispose();
+                base.OnFormClosed(e);
+            }
+
+            protected override void OnKeyDown(KeyEventArgs e)
+            {
+                base.OnKeyDown(e);
+                if (e.KeyCode == Keys.Enter) { Finish(); e.SuppressKeyPress = true; }
+                else if (e.KeyCode == Keys.Escape) { Finished = false; Close(); e.SuppressKeyPress = true; }
+            }
+        }
+
+        /// <summary>
+        /// Runs the interactive scrolling capture over a fixed screen rectangle.
+        /// Returns the stitched page (still unannotated), or null when the user
+        /// cancels or nothing new scrolled in.
+        /// </summary>
+        public static Bitmap Run(Rectangle area, bool zh)
+        {
+            Bitmap output = null;
+            using (Bitmap first = Grab(area))
+            using (Stitcher stitcher = new Stitcher(first))
+            using (Strip strip = new Strip(area, zh, stitcher.Total))
+            {
+                strip.Tick = delegate
+                {
+                    using (Bitmap frame = Grab(area))
+                    {
+                        int added = stitcher.Add(frame);
+                        if (added > 0) strip.SetProgress(stitcher.Total);
+                    }
+                };
+                strip.ShowDialog();
+                if (strip.Finished && stitcher.Total > area.Height + 8) output = stitcher.Compose();
+            }
+            return output;
+        }
+
+        /// <summary>Headless check of the stitching math: renders a tall page, feeds it in slices, compares the result.</summary>
+        public static string SelfTest(string dir)
+        {
+            int w = 380;
+            int h = 280;
+            int step = 200;
+            int pageH = 2600;
+            string path = Path.Combine(dir, "scroll-selftest.png");
+
+            using (Bitmap page = new Bitmap(w, pageH))
+            {
+                using (Graphics g = Graphics.FromImage(page))
+                {
+                    g.Clear(Color.White);
+                    for (int y = 0; y < pageH; y += 20)
+                    {
+                        using (SolidBrush brush = new SolidBrush(Color.FromArgb(255, (y * 5) % 255, (y * 11) % 255, (y * 23) % 255)))
+                        {
+                            g.FillRectangle(brush, 0, y, w, 14);
+                        }
+                    }
+                    using (Font font = new Font("Consolas", 7f))
+                    {
+                        for (int y = 4; y < pageH; y += 60) g.DrawString("line " + y, font, Brushes.Black, 6, y);
+                    }
+                }
+
+                List<Rectangle> spots = new List<Rectangle>();
+                for (int off = 0; off + h <= pageH; off += step) spots.Add(new Rectangle(0, off, w, h));
+
+                int total;
+                using (Stitcher stitcher = new Stitcher(page.Clone(spots[0], PixelFormat.Format32bppArgb)))
+                {
+                    for (int i = 1; i < spots.Count; i++)
+                    {
+                        using (Bitmap frame = page.Clone(spots[i], PixelFormat.Format32bppArgb))
+                        {
+                            stitcher.Add(frame);
+                        }
+                    }
+                    total = stitcher.Total;
+                    using (Bitmap tall = stitcher.Compose())
+                    {
+                        tall.Save(path, ImageFormat.Png);
+                    }
+                }
+
+                int expected = spots[spots.Count - 1].Bottom;
+                int bad = 0;
+                using (Bitmap stitched = new Bitmap(path))
+                {
+                    int cmpW = Math.Min(w, stitched.Width);
+                    int cmpH = Math.Min(expected, Math.Min(pageH, stitched.Height));
+                    int[] a = Pixels(page);
+                    int[] b = Pixels(stitched);
+                    for (int y = 0; y < cmpH; y++)
+                    {
+                        for (int x = 0; x < cmpW; x++)
+                        {
+                            if (a[y * w + x] != b[y * stitched.Width + x]) bad++;
+                        }
+                    }
+                }
+                return "total=" + total + " expected=" + expected + " mismatch=" + bad + " path=" + path;
+            }
+        }
+    }
+
     /// <summary>Entry point used by the capture helper.</summary>
     public static class Editor
     {
-        public static Result Run(string fullPath, int x, int y, int w, int h, string outPath, bool selfTest)
+        public static Result Run(string fullPath, int x, int y, int w, int h, string outPath, bool selfTest, bool scrollMode, string language)
         {
-            return EditorForm.Run(fullPath, x, y, w, h, outPath, selfTest);
+            return EditorForm.Run(fullPath, x, y, w, h, outPath, selfTest, scrollMode, language);
+        }
+
+        public static string ScrollSelfTest(string folder)
+        {
+            return ScrollCapture.SelfTest(folder);
         }
     }
 }
