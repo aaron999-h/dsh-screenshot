@@ -113,6 +113,7 @@ namespace DshShot
 
         Op pending;
         Point dragStart;
+        Rectangle? clickHover;
         bool dragging;
         bool selecting;
         bool moving;
@@ -1068,6 +1069,9 @@ namespace DshShot
 
             if (!hasSel)
             {
+                // A plain click (no drag) takes the window that was highlighted
+                // when the button went down; a drag draws its own region instead.
+                clickHover = hasHover && hover.Width > 8 && hover.Height > 8 ? hover : (Rectangle?)null;
                 dragStart = e.Location;
                 dragging = true;
                 selecting = true;
@@ -1162,11 +1166,17 @@ namespace DshShot
                     sel = Clip(drawn);
                     hasSel = true;
                 }
+                else if (clickHover.HasValue)
+                {
+                    sel = Clip(clickHover.Value);
+                    hasSel = sel.Width > 8 && sel.Height > 8;
+                }
                 else if (hasHover)
                 {
                     sel = hover;
                     hasSel = sel.Width > 8 && sel.Height > 8;
                 }
+                clickHover = null;
                 if (hasSel) Recalculate();
                 Invalidate();
                 return;
