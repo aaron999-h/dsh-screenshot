@@ -25,6 +25,9 @@ window.__ModuleLoader__.load({
       rowLabel: 'Screenshot',
       rowDescription: 'Select a region on the desktop and attach it to the draft',
 
+      shortcutLabel: 'Screenshot',
+      noSession: 'Open a conversation first',
+
       failedTitle: 'Selection failed',
       captureFailed: 'Could not capture the screen: {error}',
       attachFailed: 'Could not attach the image: {error}',
@@ -37,6 +40,9 @@ window.__ModuleLoader__.load({
     const zh = {
       rowLabel: '截图提问',
       rowDescription: '在全桌面框选一块区域，并把截图添加到对话里',
+
+      shortcutLabel: '截图提问',
+      noSession: '请先打开一个对话',
 
       failedTitle: '截图失败',
       captureFailed: '截屏失败：{error}',
@@ -160,6 +166,12 @@ window.__ModuleLoader__.load({
 
     const surfaces = new Map()
 
+    /**
+     * Session the overlay is currently mounted for; the keyboard command uses
+     * it so Alt+A lands in whichever conversation the composer belongs to.
+     */
+    let activeSessionId = undefined
+
     function surfaceFor(sessionId) {
       const key = String(sessionId)
       let surface = surfaces.get(key)
@@ -242,6 +254,72 @@ window.__ModuleLoader__.load({
       return event.defaultPrevented
     }
 
+    /** Timestamp of the last parked capture this page already delivered. */
+    let lastClaimedAt
+    /** Guards against the interval and the focus trigger claiming at once. */
+    let picking = false
+
+    /**
+     * Claim a capture the Host finished while this window was minimized or behind
+     * another application.
+     *
+     * The global hotkey runs entirely in the Host, so its PNG waits there until
+     * the page is alive enough to hand it to the composer. The ack happens only
+     * after the draft accepted the file, so a refusal leaves it parked.
+     */
+    async function pickupPending() {
+      if (picking) return
+      if (!('dshDesktop' in globalThis)) return
+      const session = activeSessionId
+      if (session === undefined) return
+      const surface = surfaceFor(session)
+      if (surface.state.phase === 'capturing') return
+      picking = true
+      try {
+        await claimPending(surface)
+      } finally {
+        picking = false
+      }
+    }
+
+    /**
+     * Fetch the parked capture and hand it to one composer.
+     * @param surface - the surface of the session the page is showing.
+     */
+    async function claimPending(surface) {
+      let body
+      try {
+        const response = await fetch(new URL('screenshot/v7/pending', document.baseURI), {
+          headers: { 'x-dsh-screenshot': '1' },
+        })
+        body = await response.json()
+      } catch {
+        return
+      }
+      if (body?.ok !== true || body.pending !== true) return
+      if (body.at !== undefined && body.at === lastClaimedAt) return
+      try {
+        const blob = await (await fetch(body.image)).blob()
+        const stamp = new Date()
+        const pad = (value) => String(value).padStart(2, '0')
+        const name = `screenshot-${String(stamp.getFullYear())}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}${pad(stamp.getSeconds())}.png`
+        const file = new File([blob], name, { type: 'image/png' })
+        if (!surface.deliver(file)) return
+      } catch (error) {
+        surface.fail(error instanceof Error ? error.message : String(error))
+        return
+      }
+      lastClaimedAt = body.at
+      try {
+        await fetch(new URL('screenshot/v7/pending/ack', document.baseURI), {
+          method: 'POST',
+          headers: { 'x-dsh-screenshot': '1' },
+        })
+      } catch {
+        // The next poll would attach a duplicate; the timestamp guard covers it.
+      }
+    }
+
     /* ------------------------------------------------------------------ *
      * Failure dialog (the selector itself is drawn by the Host)
      * ------------------------------------------------------------------ */
@@ -251,6 +329,7 @@ window.__ModuleLoader__.load({
       const state = useSyncExternalStore(surface.subscribe, surface.getSnapshot)
 
       useEffect(() => {
+        if (props.sessionId !== undefined) activeSessionId = props.sessionId
         surface.setDeliver((file) => attachFile(props.inputActions, file))
       })
 
@@ -298,8 +377,86 @@ window.__ModuleLoader__.load({
           id: 'screenshot-dialog',
           order: 30,
           locale: NS,
-          inject: (sessionId) => ({ surface: surfaceFor(sessionId) }),
+          inject: (sessionId) => {
+            activeSessionId = sessionId
+            return { surface: surfaceFor(sessionId) }
+          },
         }, ScreenshotDialog))
+
+        /**
+         * Start a capture for the session the overlay belongs to, if any.
+         * @returns whether a capture was started.
+         */
+        function triggerShortcut() {
+          if (!('dshDesktop' in globalThis)) return false
+          const session = activeSessionId
+          if (session === undefined) return false
+          void run(surfaceFor(session))
+          return true
+        }
+
+        /**
+         * Pick up hotkey captures: the Host can finish one while this window is
+         * minimized, where Chromium throttles timers — hence the extra triggers
+         * on visibility and focus, which fire the moment the window comes back.
+         */
+        ctx.effect(() => {
+          const trigger = () => { void pickupPending() }
+          const timer = setInterval(trigger, 2500)
+          document.addEventListener('visibilitychange', trigger)
+          window.addEventListener('focus', trigger)
+          trigger()
+          return () => {
+            clearInterval(timer)
+            document.removeEventListener('visibilitychange', trigger)
+            window.removeEventListener('focus', trigger)
+          }
+        }, 'dsh-screenshot: pending pickup')
+
+        /**
+         * Alt+A starts a capture from anywhere in the window, including while
+         * the composer has focus; the annotator then takes over the keyboard.
+         */
+        ctx.inject(['shortcuts'], (scope) => scope.effect(() => scope.shortcuts.register({
+          id: 'screenshot.capture',
+          label: () => fallbackTranslate('shortcutLabel'),
+          aliases: ['screenshot', 'screen capture', '截图', '截图提问'],
+          defaults: {
+            'desktop:windows': { code: 'KeyA', modifiers: ['alt'] },
+            'desktop:macos': { code: 'KeyA', modifiers: ['alt'] },
+            'desktop:linux': { code: 'KeyA', modifiers: ['alt'] },
+          },
+          regions: ['page', 'editable', 'terminal'],
+          modals: [],
+          resolve: () => {
+            if (!triggerShortcut()) {
+              return 'dshDesktop' in globalThis
+                ? { status: 'blocked', reason: fallbackTranslate('noSession') }
+                : { status: 'pass' }
+            }
+            return { status: 'handled', run: () => {} }
+          },
+        }), 'dsh-screenshot: capture shortcut'))
+
+        /**
+         * The same binding as a plain DOM listener: the Desktop keyboard bridge
+         * only forwards combinations it has accepted for the current revision,
+         * and a freshly registered plugin command can lag behind that until the
+         * window is reopened. Starting a capture twice is harmless because the
+         * surface refuses a second start while one is capturing.
+         */
+        ctx.effect(() => {
+          const onKeyDown = (event) => {
+            if (event.defaultPrevented || event.isComposing) return
+            if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+            if (event.code !== 'KeyA') return
+            if (!triggerShortcut()) return
+            event.preventDefault()
+            event.stopPropagation()
+          }
+          window.addEventListener('keydown', onKeyDown, true)
+          return () => { window.removeEventListener('keydown', onKeyDown, true) }
+        }, 'dsh-screenshot: capture key')
 
         ctx.inject(['commandUi'], (scope) => scope.effect(() => scope.commandUi.register({
           name: 'screenshot',
