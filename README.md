@@ -27,6 +27,15 @@ For pages taller than the screen (chat history, long articles, long documents):
 
 How the stitching works: the region is sampled every 320 ms, adjacent frames are compared row by row (SAD) to measure how far the content moved up, and only the newly revealed bottom rows are appended. A frame that did not move, or a page that changed entirely, is ignored. Height is capped at 24000 px and one session may run 180 s. The detector has a standalone self-test (`[DshShot.Editor]::ScrollSelfTest($dir)`): it renders a long page, feeds it in as slices and compares pixels.
 
+## Hotkey
+
+**Alt + A** starts a capture on the Desktop, same as `+` → **Screenshot**:
+
+- It is **global**: it fires while DSH is minimized or behind another application. The Host keeps a small helper alive that owns a Win32 `RegisterHotKey` registration, so the key never depends on window focus; after the region is chosen the main window is restored and raised so the attachment is right in front of you.
+- The same combo is also registered as a normal `ctx.shortcuts` command, so it shows up in **Settings → Shortcuts** and can be rebound there — that in-window binding is what fires while DSH has focus. Starting twice is harmless.
+- The system-wide registration is fixed to `Alt+A`. If another app already owns that combo, registration fails and the log at `%TEMP%\dsh-screenshot.log` records `hotkey unavailable: register-failed …`; the in-window binding still works.
+- The browser build (`dsh web`) has neither: capturing needs the Desktop Host.
+
 ## Install
 
 ```bash
