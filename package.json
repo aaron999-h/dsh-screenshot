@@ -1,58 +1,58 @@
 {
-    "name":  "dsh-screenshot",
-    "version": "1.3.1",
-    "description":  "Adds a Screenshot row to the composer\u0027s + menu plus a system-wide Alt+A hotkey: pick a window or drag a region anywhere on the desktop (DSH stays visible even if minimized), annotate it WeChat-style, insert/copy/save the result, or stitch a scrollable page into one tall image.",
-    "type":  "module",
-    "license":  "MIT",
-    "author":  "aaron999-h",
-    "keywords":  [
-                     "dsh-plugin",
-                     "deepseek-harness",
-                     "dsh",
-                     "screenshot",
-                     "snip",
-                     "capture",
-                     "hotkey",
-                     "desktop"
-                 ],
-    "icon":  "assets/icon.svg",
-    "repository":  {
-                       "type":  "git",
-                       "url":  "git+https://github.com/aaron999-h/dsh-screenshot.git"
-                   },
-    "homepage":  "https://github.com/aaron999-h/dsh-screenshot",
-    "bugs":  {
-                 "url":  "https://github.com/aaron999-h/dsh-screenshot/issues"
-             },
-    "exports":  {
-                    ".":  "./index.js",
-                    "./client":  "./client.js",
-                    "./locale/*.json":  "./locale/*.json",
-                    "./icon":  "./assets/icon.svg"
-                },
-    "files":  [
-                  "index.js",
-                  "client.js",
-                  "editor.cs",
-                  "cordis.patch.yml",
-                  "locale/",
-                  "docs/",
-                  "assets/",
-                  "README.md",
-                  "README.zh.md",
-                  "LICENSE"
-              ],
-    "dsh":  {
-                "bundle":  {
-                               "patch":  "./cordis.patch.yml"
-                           },
-                "client":  {
-                               "platform":  "web",
-                               "immediately":  true,
-                               "inject":  [
-                                              "@deepseek-ai/dsh-client-ui-conversation",
-                                              "@deepseek-ai/dsh-client-ui-commands"
-                                          ]
-                           }
-            }
+  "name": "dsh-screenshot",
+  "version": "1.4.1",
+  "description": "Adds a Screenshot row to the composer's + menu plus a system-wide Alt+A hotkey: pick a window or drag a region anywhere on the desktop (DSH stays visible even if minimized), annotate it WeChat-style, insert/copy/save the result, or stitch a scrollable page into one tall image.",
+  "type": "module",
+  "license": "MIT",
+  "author": "aaron999-h",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "screenshot",
+    "snip",
+    "capture",
+    "hotkey",
+    "desktop"
+  ],
+  "icon": "assets/icon.svg",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aaron999-h/dsh-screenshot.git"
+  },
+  "homepage": "https://github.com/aaron999-h/dsh-screenshot",
+  "bugs": {
+    "url": "https://github.com/aaron999-h/dsh-screenshot/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./assets/icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "editor.cs",
+    "cordis.patch.yml",
+    "locale/",
+    "docs/",
+    "assets/",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-commands"
+      ]
+    }
+  }
 }
