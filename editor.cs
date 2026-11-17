@@ -13,6 +13,39 @@ namespace DshShot
 
     public enum BtnKind { Rect, Ellipse, Line, Arrow, Pen, Mosaic, Text, Scroll, Undo, Redo, Copy, Save, Cancel, Confirm }
 
+    /// <summary>
+    /// Polls the physical Escape key so cancelling never depends on this window
+    /// holding keyboard focus. The overlay is shown without activation (and the
+    /// host may be minimised), so key messages never arrive; GetAsyncKeyState
+    /// still reports the global key state.
+    /// </summary>
+    internal static class EscWatch
+    {
+        [DllImport("user32.dll")]
+        static extern short GetAsyncKeyState(int vKey);
+
+        const int VK_ESCAPE = 0x1B;
+
+        public static void Attach(Form form, Action onEscape, Func<bool> allowed)
+        {
+            Timer timer = new Timer();
+            timer.Interval = 30;
+            bool down = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+            timer.Tick += delegate
+            {
+                bool now = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+                if (allowed != null && !allowed()) { down = now; return; }
+                if (now && !down)
+                {
+                    try { onEscape(); } catch { }
+                }
+                down = now;
+            };
+            form.Shown += delegate { timer.Start(); };
+            form.FormClosed += delegate { timer.Stop(); timer.Dispose(); };
+        }
+    }
+
     public class Op
     {
         public ToolKind Kind;
@@ -182,6 +215,8 @@ namespace DshShot
             buttons.Add(BtnKind.Save);
             buttons.Add(BtnKind.Cancel);
             buttons.Add(BtnKind.Confirm);
+
+            EscWatch.Attach(this, HandleEscape, delegate { return !scrollOpen; });
 
             Recalculate();
         }
@@ -1769,6 +1804,7 @@ namespace DshShot
             Log("scroll start area=" + area);
             Hide();
             Bitmap stitched = null;
+            scrollOpen = true;
             try
             {
                 stitched = ScrollCapture.Run(area, zh);
@@ -1776,6 +1812,10 @@ namespace DshShot
             catch (Exception error)
             {
                 Log("scroll failed " + error.Message);
+            }
+            finally
+            {
+                scrollOpen = false;
             }
             if (stitched == null)
             {
@@ -1965,17 +2005,32 @@ namespace DshShot
             }
         }
 
+        long lastEscape;
+
+        /// <summary>True while the scroll panel owns Escape.</summary>
+        bool scrollOpen;
+
+        /// <summary>One Escape press, from the focused window or the global watch.</summary>
+        void HandleEscape()
+        {
+            long now = Environment.TickCount;
+            if (now - lastEscape < 160) return;
+            lastEscape = now;
+
+            if (input != null) { CancelText(); return; }
+            if (selected != null) { selected = null; Invalidate(); return; }
+            if (tool != ToolKind.None) { tool = ToolKind.None; Recalculate(); Invalidate(); return; }
+            if (hasSel) { hasSel = false; Recalculate(); Invalidate(); return; }
+            Finish("cancel");
+        }
+
         protected override void OnKeyDown(KeyEventArgs e)
         {
             base.OnKeyDown(e);
             if (input != null) return;
             if (e.KeyCode == Keys.Escape)
             {
-                if (selected != null) { selected = null; }
-                else if (tool != ToolKind.None) { tool = ToolKind.None; Recalculate(); }
-                else if (hasSel) { hasSel = false; Recalculate(); }
-                else { Finish("cancel"); }
-                Invalidate();
+                HandleEscape();
                 e.SuppressKeyPress = true;
             }
             else if (e.Control && e.KeyCode == Keys.Z)
@@ -2056,6 +2111,19 @@ namespace DshShot
         public const int TickMs = 320;
         public const int MaxSeconds = 180;
 
+        internal static void Trace(string message)
+        {
+            try
+            {
+                string path = Environment.GetEnvironmentVariable("DSH_EDITOR_LOG");
+                if (string.IsNullOrEmpty(path)) return;
+                File.AppendAllText(path, DateTime.Now.ToString("HH:mm:ss.fff") + " " + message + Environment.NewLine);
+            }
+            catch
+            {
+            }
+        }
+
         internal static Bitmap Grab(Rectangle area)
         {
             Bitmap bmp = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppArgb);
@@ -2128,64 +2196,461 @@ namespace DshShot
             return bestScore > 24.0 ? -1 : best;
         }
 
-        /// <summary>Accumulates the slices of a scrolling page into one tall bitmap.</summary>
+        /// <summary>
+        /// Signed vertical shift between two frames: &gt;0 means the content moved up
+        /// (the page scrolled down), &lt;0 means it moved down (the page scrolled up),
+        /// 0 means nothing moved, and int.MinValue means the frames share no reliable
+        /// overlap. Only a hint: the stitcher anchors each frame against everything it
+        /// has already captured, so a wrong hint cannot duplicate rows.
+        /// </summary>
+        public static int DetectSigned(int[] prev, int[] next, int w, int h)
+        {
+            if (Diff(prev, next, w, 0, 0, h) < 3.0) return 0;
+            int best = int.MinValue;
+            double bestScore = double.MaxValue;
+            int max = h - 16;
+            for (int s = 8; s <= max; s += 2)
+            {
+                int rows = Math.Min(h - s, Math.Max(48, h / 2));
+                double up = Diff(prev, next, w, s, 0, rows);
+                if (up < bestScore) { bestScore = up; best = s; }
+                double down = Diff(prev, next, w, 0, s, rows);
+                if (down < bestScore) { bestScore = down; best = -s; }
+            }
+            return bestScore > 18.0 ? int.MinValue : best;
+        }
+
+        /// <summary>
+        /// Accumulates a scrolling page into one tall bitmap.
+        /// Rows already captured are never captured again: every frame is anchored
+        /// against the pixels already in the buffer (an absolute page row), and only
+        /// rows that differ are written, so scrolling down, up and down again cannot
+        /// duplicate a slice — the frame simply lands back on the rows it came from.
+        /// </summary>
         public sealed class Stitcher : IDisposable
         {
             readonly int width;
             readonly int height;
-            readonly List<Bitmap> bands = new List<Bitmap>();
+            readonly Bitmap buffer;
+            readonly int origin;
+            int filledTop;
+            int filledBottom;
+            int viewport;
             int[] lastPixels;
 
             public Stitcher(Bitmap first)
             {
                 width = first.Width;
                 height = first.Height;
-                bands.Add(first);
-                Total = height;
+                origin = MaxHeight / 2;
+                buffer = new Bitmap(width, MaxHeight, PixelFormat.Format32bppArgb);
+                using (Graphics g = Graphics.FromImage(buffer)) g.Clear(Color.White);
                 lastPixels = Pixels(first);
+                WriteRows(lastPixels, 0, null);
             }
 
+            /// <summary>Height of the captured page: filledBottom - filledTop.</summary>
             public int Total { get; private set; }
 
             public int Width { get { return width; } }
 
-            /// <summary>Appends the rows the frame revealed at its bottom; returns how many (0 when nothing new).</summary>
+            /// <summary>Why the last frame was dropped, or null when it was accepted.</summary>
+            public string LastNote { get; private set; }
+
+            /// <summary>
+            /// Places the frame on the page and writes the rows it actually brings.
+            /// Returns how many page rows the captured span grew (0 when the frame
+            /// covered ground that had already been captured).
+            /// </summary>
             public int Add(Bitmap frame)
             {
-                if (Total >= MaxHeight) return 0;
                 int[] px = Pixels(frame);
-                int shift = Detect(lastPixels, px, width, height);
-                if (shift <= 6 || shift > height - 16 || Total + shift > MaxHeight) return 0;
-                Bitmap band = new Bitmap(width, shift, PixelFormat.Format32bppArgb);
-                using (Graphics g = Graphics.FromImage(band))
+                int shift = DetectSigned(lastPixels, px, width, height);
+                if (shift == 0) return 0;
+
+                int before = Total;
+                int hinted = shift == int.MinValue ? 0 : shift;
+                int guess = viewport + hinted;
+                int placed;
+                if (!TryAnchor(px, guess, hinted, out placed))
                 {
-                    g.DrawImage(frame, new Rectangle(0, 0, width, shift), new Rectangle(0, height - shift, width, shift), GraphicsUnit.Pixel);
+                    // Never place a frame that could not be verified: a wrong offset shows up
+                    // as a shifted or duplicated band, which is worse than one missing slice.
+                    Trace("scroll skip unverified hint=" + hinted + " guess=" + guess + " known=" + KnownOverlap(guess));
+                    LastNote = Math.Abs(hinted) >= height - 16 || KnownOverlap(guess) < Math.Max(12, height / 24)
+                        ? "这一帧和已拼好的部分没有重叠（一次滚太多了，请分两三次滚，或用「自动滚动」）"
+                        : "这一帧对不齐（画面在滚动时变了），已跳过";
+                    lastPixels = px;
+                    return 0;
                 }
-                bands.Add(band);
-                Total += shift;
+                LastNote = null;
+                viewport = placed;
+                WriteRows(px, placed, lastPixels);
                 lastPixels = px;
-                return shift;
+                int grew = Total - before;
+                Trace("scroll add hint=" + (shift == int.MinValue ? 0 : shift) + " placed=" + placed + " grew=" + grew + " total=" + Total);
+                return grew;
+            }
+
+            /// <summary>How many of the frame's rows cover ground that has already been captured.</summary>
+            int KnownOverlap(int offset)
+            {
+                int from = Math.Max(0, filledTop - offset);
+                int to = Math.Min(height, filledBottom - offset);
+                return to > from ? to - from : 0;
+            }
+
+            int Clamp(int pageTop)
+            {
+                // Keep at least 16 rows of overlap with what has already been captured.
+                int highest = filledBottom - 16;
+                int lowest = filledTop + 16 - height;
+                if (lowest > highest) lowest = highest;
+                if (pageTop > highest) return highest;
+                if (pageTop < lowest) return lowest;
+                return pageTop;
+            }
+
+            /// <summary>
+            /// Finds where the frame already sits on the captured page. The shift hint
+            /// is only a starting point: when nothing matches there, the whole captured
+            /// page is scanned, so scrolling back over known ground always lands on the
+            /// rows it came from instead of being appended a second time.
+            /// A wheel notch can move a page by nearly a full screen, which leaves too few
+            /// overlapping rows for the normal search; those frames get a second pass that
+            /// asks for fewer rows but a cleaner match.
+            /// </summary>
+            bool TryAnchor(int[] px, int guess, int hint, out int placed)
+            {
+                placed = guess;
+                int sliceTop = filledTop - height;
+                int sliceBottom = filledBottom + height;
+                int[] slice = ReadRows(sliceTop, sliceBottom - sliceTop);
+                if (slice == null) return false;
+                int sliceRows = slice.Length / width;
+
+                if (Search(px, slice, sliceTop, sliceRows, guess, hint, Math.Max(24, height / 6), false, out placed)) return true;
+                return Search(px, slice, sliceTop, sliceRows, guess, hint, Math.Max(12, height / 24), true, out placed);
+            }
+
+            /// <summary>Runs the hint window first, then the whole captured page.</summary>
+            bool Search(int[] px, int[] slice, int sliceTop, int sliceRows, int guess, int hint, int needRows, bool tight, out int placed)
+            {
+                placed = guess;
+
+                int at;
+                if (BestOffset(px, slice, sliceTop, sliceRows, guess - 160, guess + 160, 2, 3, 6, needRows, 10.0, out at))
+                {
+                    return Accept(px, slice, sliceTop, sliceRows, at, guess, needRows, tight, out placed);
+                }
+
+                int lo = filledTop - height + 16;
+                int hi = filledBottom - 16;
+                if (hi > lo && BestOffset(px, slice, sliceTop, sliceRows, lo, hi, 8, 6, 8, needRows, 10.0, out at))
+                {
+                    return Accept(px, slice, sliceTop, sliceRows, at, guess, needRows, tight, out placed);
+                }
+                return false;
+            }
+
+            /// <summary>
+            /// Refines a candidate to the pixel and only trusts it when the overlap matches
+            /// almost exactly — that is what keeps a slice from landing a few rows off. A
+            /// page that repaints while it scrolls (sticky headers, hover highlights, a
+            /// rasterised PDF) never reaches an exact match on the mean score, so the
+            /// fallback asks a different question: do most rows still line up? A misplaced
+            /// slice smears text across rows and fails that test immediately.
+            /// </summary>
+            bool Accept(int[] px, int[] slice, int sliceTop, int sliceRows, int candidate, int prefer, int needRows, bool tight, out int placed)
+            {
+                placed = candidate;
+                int at;
+                if (!BestOffset(px, slice, sliceTop, sliceRows, candidate - 8, candidate + 8, 1, 2, 3, needRows, 10.0, out at))
+                {
+                    Trace("anchor refine none cand=" + candidate);
+                    return false;
+                }
+                double fine = ScoreAt(slice, sliceTop, sliceRows, px, at, 1, 2);
+                // Repeated rows (a list of identical file entries, a tiled rule) give several
+                // equally good offsets; taking the wrong one is what duplicates a band. When the
+                // runner-up is nearly as good, fall back to the offset the motion hint predicts.
+                double rival = RivalScore(slice, sliceTop, sliceRows, px, at);
+                if (rival < fine * 1.6 + 1.0)
+                {
+                    int picked = PickNear(slice, sliceTop, sliceRows, px, prefer, needRows);
+                    if (picked == int.MinValue)
+                    {
+                        Trace("anchor reject at=" + at + " ambiguous fine=" + fine.ToString("F2") + " rival=" + rival.ToString("F2"));
+                        return false;
+                    }
+                    Trace("anchor prefer at=" + at + " -> " + picked + " (ambiguous fine=" + fine.ToString("F2") + " rival=" + rival.ToString("F2") + ")");
+                    at = picked;
+                    fine = ScoreAt(slice, sliceTop, sliceRows, px, at, 1, 2);
+                }
+                // A frame that only overlaps by a dozen rows can look convincing by accident,
+                // so that pass has to be cleaner than the ordinary one.
+                double fineLimit = tight ? 6.0 : 12.0;
+                double ratioLimit = tight ? 0.92 : 0.75;
+                if (fine > fineLimit)
+                {
+                    double ratio = RowRatio(slice, sliceTop, sliceRows, px, at, 2, 6.0);
+                    if (ratio < ratioLimit)
+                    {
+                        Trace("anchor reject at=" + at + " fine=" + fine.ToString("F2") + " ratio=" + ratio.ToString("F2") + (tight ? " tight" : ""));
+                        return false;
+                    }
+                }
+                placed = Clamp(at);
+                return true;
+            }
+
+            /// <summary>
+            /// Picks the best offset while staying close to where the motion hint says the
+            /// frame should land; used when several offsets score equally well.
+            /// </summary>
+            int PickNear(int[] slice, int sliceTop, int sliceRows, int[] px, int prefer, int needRows)
+            {
+                int bestAt = int.MinValue;
+                double best = double.MaxValue;
+                for (int off = prefer - 180; off <= prefer + 180; off += 2)
+                {
+                    if (OverlapRows(off, sliceTop, sliceRows) < needRows) continue;
+                    int ink;
+                    double score = ScoreInk(slice, sliceTop, sliceRows, px, off, 2, 4, out ink);
+                    if (ink < Math.Max(6, needRows / 3)) continue;
+                    score += 0.03 * Math.Abs(off - prefer);
+                    if (score < best) { best = score; bestAt = off; }
+                }
+                return bestAt;
+            }
+
+            /// <summary>
+            /// Fraction of the overlapping rows that match almost row for row. Unlike the
+            /// mean score this tolerates a moving cursor, a blinking caret or one animating
+            /// block, which is exactly the noise a live page adds.
+            /// </summary>
+            double RowRatio(int[] slice, int sliceTop, int sliceRows, int[] px, int offset, int rowStep, double rowLimit)
+            {
+                int from = Math.Max(0, filledTop - offset);
+                int to = Math.Min(height, filledBottom - offset);
+                from = Math.Max(from, sliceTop - offset);
+                to = Math.Min(to, sliceTop + sliceRows - offset);
+                int good = 0;
+                int total = 0;
+                for (int y = from; y < to; y += rowStep)
+                {
+                    int a = y * width;
+                    int b = (offset + y - sliceTop) * width;
+                    int sum = 0;
+                    int samples = 0;
+                    for (int x = 0; x < width; x += 2)
+                    {
+                        int pa = px[a + x];
+                        int pb = slice[b + x];
+                        samples++;
+                        if (pa == pb) continue;
+                        sum += Math.Abs(((pa >> 16) & 0xFF) - ((pb >> 16) & 0xFF))
+                             + Math.Abs(((pa >> 8) & 0xFF) - ((pb >> 8) & 0xFF))
+                             + Math.Abs((pa & 0xFF) - (pb & 0xFF));
+                    }
+                    if (samples == 0) continue;
+                    total++;
+                    if ((double)sum / samples <= rowLimit) good++;
+                }
+                return total == 0 ? 0.0 : (double)good / total;
+            }
+
+            /// <summary>True when the row carries real content (text, a rule, an image edge).</summary>
+            bool RowIsInk(int[] px, int rowStart)
+            {
+                int lo = 255, hi = 0;
+                for (int x = 0; x < width; x += 4)
+                {
+                    int c = px[rowStart + x];
+                    int lum = (((c >> 16) & 0xFF) * 30 + ((c >> 8) & 0xFF) * 59 + (c & 0xFF) * 11) / 100;
+                    if (lum < lo) lo = lum;
+                    if (lum > hi) hi = lum;
+                    if (hi - lo > 36) return true;
+                }
+                return hi - lo > 36;
+            }
+
+            /// <summary>Mean difference over the content rows of the overlap only.</summary>
+            double ScoreInk(int[] slice, int sliceTop, int sliceRows, int[] px, int offset, int rowStep, int colStep, out int inkRows)
+            {
+                inkRows = 0;
+                int sum = 0;
+                int samples = 0;
+                int from = Math.Max(0, filledTop - offset);
+                int to = Math.Min(height, filledBottom - offset);
+                from = Math.Max(from, sliceTop - offset);
+                to = Math.Min(to, sliceTop + sliceRows - offset);
+                for (int y = from; y < to; y += rowStep)
+                {
+                    int a = y * width;
+                    int b = (offset + y - sliceTop) * width;
+                    if (!RowIsInk(px, a)) continue;
+                    inkRows++;
+                    for (int x = 0; x < width; x += colStep)
+                    {
+                        int pa = px[a + x];
+                        int pb = slice[b + x];
+                        samples++;
+                        if (pa == pb) continue;
+                        sum += Math.Abs(((pa >> 16) & 0xFF) - ((pb >> 16) & 0xFF))
+                             + Math.Abs(((pa >> 8) & 0xFF) - ((pb >> 8) & 0xFF))
+                             + Math.Abs((pa & 0xFF) - (pb & 0xFF));
+                    }
+                }
+                return samples == 0 ? double.MaxValue : (double)sum / samples;
+            }
+
+            /// <summary>Best score among offsets that are clearly away from the chosen one.</summary>
+            double RivalScore(int[] slice, int sliceTop, int sliceRows, int[] px, int at)
+            {
+                double best = double.MaxValue;
+                for (int off = at - 72; off <= at + 72; off += 4)
+                {
+                    if (off > at - 12 && off < at + 12) continue;
+                    if (OverlapRows(off, sliceTop, sliceRows) < 12) continue;
+                    int ink;
+                    double score = ScoreInk(slice, sliceTop, sliceRows, px, off, 3, 4, out ink);
+                    if (ink < 6) continue;
+                    if (score < best) best = score;
+                }
+                return best;
+            }
+
+            bool BestOffset(int[] px, int[] slice, int sliceTop, int sliceRows, int lo, int hi, int stride,
+                            int rowStep, int colStep, int needRows, double limit, out int bestAt)
+            {
+                bestAt = int.MinValue;
+                double best = double.MaxValue;
+                for (int off = lo; off <= hi; off += stride)
+                {
+                    if (OverlapRows(off, sliceTop, sliceRows) < needRows) continue;
+                    double score = ScoreAt(slice, sliceTop, sliceRows, px, off, rowStep, colStep);
+                    if (score < best) { best = score; bestAt = off; }
+                }
+                return bestAt != int.MinValue && best <= limit;
+            }
+
+            int OverlapRows(int offset, int sliceTop, int sliceRows)
+            {
+                int from = Math.Max(0, filledTop - offset);
+                int to = Math.Min(height, filledBottom - offset);
+                from = Math.Max(from, sliceTop - offset);
+                to = Math.Min(to, sliceTop + sliceRows - offset);
+                return to > from ? to - from : 0;
+            }
+
+            double ScoreAt(int[] slice, int sliceTop, int sliceRows, int[] px, int offset, int rowStep, int colStep)
+            {
+                int sum = 0;
+                int samples = 0;
+                int from = Math.Max(0, filledTop - offset);
+                int to = Math.Min(height, filledBottom - offset);
+                from = Math.Max(from, sliceTop - offset);
+                to = Math.Min(to, sliceTop + sliceRows - offset);
+                for (int y = from; y < to; y += rowStep)
+                {
+                    int a = y * width;
+                    int b = (offset + y - sliceTop) * width;
+                    for (int x = 0; x < width; x += colStep)
+                    {
+                        int pa = px[a + x];
+                        int pb = slice[b + x];
+                        samples++;
+                        if (pa == pb) continue;
+                        sum += Math.Abs(((pa >> 16) & 0xFF) - ((pb >> 16) & 0xFF))
+                             + Math.Abs(((pa >> 8) & 0xFF) - ((pb >> 8) & 0xFF))
+                             + Math.Abs((pa & 0xFF) - (pb & 0xFF));
+                    }
+                }
+                return samples == 0 ? double.MaxValue : (double)sum / samples;
+            }
+
+            int[] ReadRows(int pageTop, int rows)
+            {
+                int top = origin + pageTop;
+                if (top < 0) { rows += top; top = 0; }
+                if (top + rows > MaxHeight) rows = MaxHeight - top;
+                if (rows <= 0) return null;
+                int[] slice = new int[rows * width];
+                BitmapData data = buffer.LockBits(new Rectangle(0, top, width, rows), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+                try
+                {
+                    for (int y = 0; y < rows; y++)
+                    {
+                        Marshal.Copy(new IntPtr(data.Scan0.ToInt64() + (long)y * data.Stride), slice, y * width, width);
+                    }
+                }
+                finally
+                {
+                    buffer.UnlockBits(data);
+                }
+                return slice;
+            }
+
+            /// <summary>Writes the frame at page row pageTop, skipping rows that are already identical.</summary>
+            void WriteRows(int[] px, int pageTop, int[] prev)
+            {
+                BitmapData data = buffer.LockBits(new Rectangle(0, 0, width, MaxHeight), ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+                try
+                {
+                    int[] row = new int[width];
+                    for (int y = 0; y < height; y++)
+                    {
+                        int bufRow = origin + pageTop + y;
+                        if (bufRow < 0 || bufRow >= MaxHeight) continue;
+                        int src = y * width;
+                        // A row identical to the same screen row of the previous frame is pinned
+                        // to the viewport (sticky header, floating toolbar, scrollbar). Writing it
+                        // at every new offset would stamp that strip across the whole page — the
+                        // duplicated band this keeps away.
+                        if (prev != null && RowSame(prev, src, px, src)) continue;
+                        IntPtr target = new IntPtr(data.Scan0.ToInt64() + (long)bufRow * data.Stride);
+                        Marshal.Copy(target, row, 0, width);
+                        bool same = true;
+                        for (int x = 0; x < width; x++)
+                        {
+                            if (row[x] != px[src + x]) { same = false; break; }
+                        }
+                        if (same) continue;
+                        Marshal.Copy(px, src, target, width);
+                    }
+                }
+                finally
+                {
+                    buffer.UnlockBits(data);
+                }
+
+                if (pageTop < filledTop) filledTop = pageTop;
+                if (pageTop + height > filledBottom) filledBottom = pageTop + height;
+                Total = filledBottom - filledTop;
+            }
+
+            bool RowSame(int[] a, int aStart, int[] b, int bStart)
+            {
+                for (int x = 0; x < width; x++)
+                {
+                    if (a[aStart + x] != b[bStart + x]) return false;
+                }
+                return true;
             }
 
             public Bitmap Compose()
             {
-                Bitmap tall = new Bitmap(width, Total, PixelFormat.Format32bppArgb);
-                using (Graphics g = Graphics.FromImage(tall))
-                {
-                    int y = 0;
-                    foreach (Bitmap band in bands)
-                    {
-                        g.DrawImageUnscaled(band, 0, y);
-                        y += band.Height;
-                    }
-                }
-                return tall;
+                int rows = Math.Max(1, Total);
+                int top = origin + filledTop;
+                if (top < 0) top = 0;
+                if (top + rows > MaxHeight) rows = MaxHeight - top;
+                return buffer.Clone(new Rectangle(0, top, width, Math.Max(1, rows)), PixelFormat.Format32bppArgb);
             }
 
             public void Dispose()
             {
-                foreach (Bitmap band in bands) band.Dispose();
-                bands.Clear();
+                buffer.Dispose();
             }
         }
 
@@ -2194,7 +2659,11 @@ namespace DshShot
         {
             readonly Label caption;
             readonly Timer timer;
+            readonly Button auto;
+            readonly bool zh;
             int ticks;
+            int lastTotal;
+            string hint = "";
             bool busy;
 
             public Action Tick;
@@ -2208,26 +2677,33 @@ namespace DshShot
                 ShowInTaskbar = false;
                 MinimizeBox = false;
                 MaximizeBox = false;
-                ClientSize = new Size(330, 96);
+                ClientSize = new Size(330, 104);
                 Text = zh ? "滚动截图" : "Scrolling capture";
+                this.zh = zh;
 
                 caption = new Label();
                 caption.AutoSize = false;
-                caption.Bounds = new Rectangle(12, 10, 306, 44);
-                caption.Text = Progress(total, zh);
+                caption.Bounds = new Rectangle(12, 10, 306, 52);
+                caption.Text = Progress(total, zh, false);
                 caption.ForeColor = Color.FromArgb(44, 46, 54);
+
+                auto = new Button();
+                auto.Text = zh ? "自动滚动" : "Auto scroll";
+                auto.Bounds = new Rectangle(12, 68, 100, 26);
+                auto.Click += delegate { Auto = !Auto; auto.Text = Auto ? (this.zh ? "暂停" : "Pause") : (this.zh ? "自动滚动" : "Auto scroll"); hint = ""; SetProgress(lastTotal); };
 
                 Button done = new Button();
                 done.Text = zh ? "完成" : "Done";
-                done.Bounds = new Rectangle(150, 60, 80, 26);
+                done.Bounds = new Rectangle(144, 68, 80, 26);
                 done.Click += delegate { Finish(); };
 
                 Button cancel = new Button();
                 cancel.Text = zh ? "取消" : "Cancel";
-                cancel.Bounds = new Rectangle(238, 60, 80, 26);
+                cancel.Bounds = new Rectangle(232, 68, 80, 26);
                 cancel.Click += delegate { Finished = false; Close(); };
 
                 Controls.Add(caption);
+                Controls.Add(auto);
                 Controls.Add(done);
                 Controls.Add(cancel);
 
@@ -2243,18 +2719,48 @@ namespace DshShot
                 timer = new Timer();
                 timer.Interval = TickMs;
                 timer.Tick += OnTick;
+
+                EscWatch.Attach(this, delegate { Finished = false; Close(); }, null);
             }
 
-            static string Progress(int total, bool zh)
+            /// <summary>True while the plugin scrolls the window underneath by itself.</summary>
+            public bool Auto { get; private set; }
+
+            public void StopAuto(string note)
             {
-                return zh
-                    ? "在下面那个窗口里滚动，滚到底后点「完成」\n已拼接 " + total + " px"
-                    : "Scroll the window underneath, then press Done.\nStitched " + total + " px";
+                if (!Auto) return;
+                Auto = false;
+                auto.Text = zh ? "自动滚动" : "Auto scroll";
+                hint = note;
+                SetProgress(lastTotal);
+            }
+
+            /// <summary>Explains in the panel why a frame was dropped.</summary>
+            public void Note(string text)
+            {
+                string next = text ?? "";
+                if (next == hint) return;
+                hint = next;
+                SetProgress(lastTotal);
+            }
+
+            static string Progress(int total, bool zh, bool scrolling)
+            {
+                if (zh)
+                {
+                    return (scrolling ? "自动滚动中…（点「暂停」可以自己滚）" : "在下面那个窗口里滚动，滚到底后点「完成」")
+                        + "\n已拼接 " + total + " px";
+                }
+                return (scrolling ? "Auto scrolling… (press Pause to scroll yourself)" : "Scroll the window underneath, then press Done.")
+                    + "\nStitched " + total + " px";
             }
 
             public void SetProgress(int total)
             {
-                caption.Text = Progress(total, Text == "滚动截图");
+                lastTotal = total;
+                string text = Progress(total, zh, Auto);
+                if (hint.Length > 0) text += "\n" + hint;
+                caption.Text = text;
             }
 
             void OnTick(object sender, EventArgs e)
@@ -2282,6 +2788,13 @@ namespace DshShot
             protected override void OnShown(EventArgs e)
             {
                 base.OnShown(e);
+                // The dimming mask is shown first and is also top-most; re-asserting
+                // TopMost here puts the strip at the very top of the top-most band so
+                // its buttons stay clickable while the mask is up.
+                TopMost = false;
+                TopMost = true;
+                Activate();
+                BringToFront();
                 timer.Start();
             }
 
@@ -2301,6 +2814,77 @@ namespace DshShot
         }
 
         /// <summary>
+        /// Click-through dimmer shown while the scrolling capture runs: everything
+        /// outside the region is darkened and the region itself stays fully clear,
+        /// so the pixels being stitched keep their real brightness and colour (the
+        /// same "frame the page" look as the WeChat scrolling snip). Mouse and
+        /// wheel input fall straight through to the window underneath.
+        /// </summary>
+        sealed class Mask : Form
+        {
+            [DllImport("user32.dll")]
+            static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint colorKey, byte alpha, uint flags);
+
+            const uint LWA_ALPHA = 0x2;
+            const byte DimAlpha = 122;
+
+            readonly Rectangle area;
+
+            public Mask(Rectangle region)
+            {
+                area = region;
+                FormBorderStyle = FormBorderStyle.None;
+                StartPosition = FormStartPosition.Manual;
+                ShowInTaskbar = false;
+                TopMost = true;
+                BackColor = Color.FromArgb(8, 10, 16);
+                Bounds = SystemInformation.VirtualScreen;
+            }
+
+            const int WS_EX_TOPMOST = 0x00000008;
+            const int WS_EX_TRANSPARENT = 0x00000020;
+            const int WS_EX_TOOLWINDOW = 0x00000080;
+            const int WS_EX_LAYERED = 0x00080000;
+            const int WS_EX_NOACTIVATE = 0x08000000;
+
+            protected override CreateParams CreateParams
+            {
+                get
+                {
+                    CreateParams cp = base.CreateParams;
+                    cp.ExStyle |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST;
+                    return cp;
+                }
+            }
+
+            protected override bool ShowWithoutActivation { get { return true; } }
+
+            protected override void OnHandleCreated(EventArgs e)
+            {
+                base.OnHandleCreated(e);
+                SetLayeredWindowAttributes(Handle, 0, DimAlpha, LWA_ALPHA);
+
+                // Cut the region out of the window itself: the pixels being
+                // stitched stay untouched (the live window shows through), and
+                // everything else is one uniform translucent sheet.
+                Rectangle hole = new Rectangle(area.Left - Bounds.Left, area.Top - Bounds.Top, area.Width, area.Height);
+                using (Region shape = new Region(new Rectangle(0, 0, Bounds.Width, Bounds.Height)))
+                {
+                    shape.Exclude(hole);
+                    Region = shape.Clone();
+                }
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                base.OnPaint(e);
+                Rectangle hole = new Rectangle(area.Left - Bounds.Left, area.Top - Bounds.Top, area.Width, area.Height);
+                using (Pen edge = new Pen(Color.FromArgb(220, 255, 255, 255), 1.5f))
+                    e.Graphics.DrawRectangle(edge, hole.X - 1, hole.Y - 1, hole.Width + 1, hole.Height + 1);
+            }
+        }
+
+        /// <summary>
         /// Runs the interactive scrolling capture over a fixed screen rectangle.
         /// Returns the stitched page (still unannotated), or null when the user
         /// cancels or nothing new scrolled in.
@@ -2311,19 +2895,140 @@ namespace DshShot
             using (Bitmap first = Grab(area))
             using (Stitcher stitcher = new Stitcher(first))
             using (Strip strip = new Strip(area, zh, stitcher.Total))
+            using (Mask mask = new Mask(area))
             {
-                strip.Tick = delegate
+                AutoScroll auto = new AutoScroll(area);
+                mask.Show();
+                try
                 {
-                    using (Bitmap frame = Grab(area))
+                    strip.Tick = delegate
                     {
-                        int added = stitcher.Add(frame);
-                        if (added > 0) strip.SetProgress(stitcher.Total);
-                    }
-                };
-                strip.ShowDialog();
+                        if (strip.Auto)
+                        {
+                            if (auto.NeedsCapture)
+                            {
+                                using (Bitmap frame = Grab(area))
+                                {
+                                    int added = stitcher.Add(frame);
+                                    if (added > 0) strip.SetProgress(stitcher.Total);
+                                    if (!auto.AfterCapture(added)) strip.StopAuto(zh ? "已经滚到底了" : "Reached the end");
+                                }
+                            }
+                            else
+                            {
+                                auto.Scroll();
+                            }
+                            return;
+                        }
+                        using (Bitmap frame = Grab(area))
+                        {
+                            int added = stitcher.Add(frame);
+                            if (added > 0) strip.SetProgress(stitcher.Total);
+                            else strip.Note(stitcher.LastNote);
+                        }
+                    };
+                    strip.ShowDialog();
+                }
+                finally
+                {
+                    mask.Hide();
+                }
                 if (strip.Finished && stitcher.Total > area.Height + 8) output = stitcher.Compose();
             }
             return output;
+        }
+
+        [DllImport("user32.dll")]
+        static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        static extern IntPtr WindowFromPoint(POINT point);
+
+        [DllImport("user32.dll")]
+        static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+
+        [DllImport("user32.dll")]
+        static extern void mouse_event(uint flags, uint dx, uint dy, uint delta, UIntPtr extra);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        const uint WM_MOUSEWHEEL = 0x020A;
+        const uint MOUSEEVENTF_WHEEL = 0x0800;
+
+        /// <summary>Scrolls the window under the region without touching the cursor.</summary>
+        internal static void PostWheel(Rectangle area)
+        {
+            int cx = area.Left + area.Width / 2;
+            int cy = area.Top + area.Height / 2;
+            POINT p;
+            p.X = cx;
+            p.Y = cy;
+            IntPtr hwnd = WindowFromPoint(p);
+            if (hwnd == IntPtr.Zero) return;
+            IntPtr root = GetAncestor(hwnd, 2);
+            if (root != IntPtr.Zero) hwnd = root;
+            IntPtr wParam = new IntPtr(unchecked((int)((uint)(-120 << 16))));
+            IntPtr lParam = new IntPtr((cy << 16) | (cx & 0xFFFF));
+            PostMessage(hwnd, WM_MOUSEWHEEL, wParam, lParam);
+        }
+
+        /// <summary>Fallback for windows that ignore posted wheels: real wheel, cursor restored.</summary>
+        internal static void RealWheel(Rectangle area)
+        {
+            Point saved = Cursor.Position;
+            Cursor.Position = new Point(area.Left + area.Width / 2, area.Top + area.Height / 2);
+            System.Threading.Thread.Sleep(25);
+            mouse_event(MOUSEEVENTF_WHEEL, 0, 0, unchecked((uint)(-120)), UIntPtr.Zero);
+            System.Threading.Thread.Sleep(25);
+            Cursor.Position = saved;
+        }
+
+        /// <summary>Alternates "scroll one notch" and "capture", and gives up when the page stops.</summary>
+        internal sealed class AutoScroll
+        {
+            readonly Rectangle area;
+            int idle;
+            int silent;
+            bool needsCapture = true;
+
+            public AutoScroll(Rectangle area)
+            {
+                this.area = area;
+            }
+
+            public bool NeedsCapture { get { return needsCapture; } }
+
+            public void Scroll()
+            {
+                // Real wheel input is what browsers and PDF viewers actually listen to;
+                // the cursor is put back right after, so the user keeps working.
+                RealWheel(area);
+                needsCapture = true;
+            }
+
+            /// <summary>Feeds one capture result; false when the page has stopped moving.</summary>
+            public bool AfterCapture(int added)
+            {
+                needsCapture = false;
+                if (added > 0)
+                {
+                    idle = 0;
+                    silent = 0;
+                    return true;
+                }
+                idle++;
+                if (idle >= 3)
+                {
+                    silent++;
+                    idle = 2;
+                }
+                return silent < 6;
+            }
         }
 
         /// <summary>Headless check of the stitching math: renders a tall page, feeds it in slices, compares the result.</summary>
@@ -2354,7 +3059,16 @@ namespace DshShot
                 }
 
                 List<Rectangle> spots = new List<Rectangle>();
-                for (int off = 0; off + h <= pageH; off += step) spots.Add(new Rectangle(0, off, w, h));
+                int expected = 0;
+                for (int off = 0; off + h <= pageH; off += step)
+                {
+                    spots.Add(new Rectangle(0, off, w, h));
+                    if (off + h > expected) expected = off + h;
+                }
+                // Scroll back up over ground that has already been captured, then down
+                // again: nothing repeated may be appended a second time.
+                for (int i = spots.Count - 2; i >= 1; i--) spots.Add(spots[i]);
+                for (int i = 1; i < spots.Count / 3; i++) spots.Add(spots[i]);
 
                 int total;
                 using (Stitcher stitcher = new Stitcher(page.Clone(spots[0], PixelFormat.Format32bppArgb)))
@@ -2373,7 +3087,6 @@ namespace DshShot
                     }
                 }
 
-                int expected = spots[spots.Count - 1].Bottom;
                 int bad = 0;
                 using (Bitmap stitched = new Bitmap(path))
                 {
