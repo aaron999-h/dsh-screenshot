@@ -2,6 +2,19 @@
 
 Adds a **Screenshot** row to the composer's `+` menu. Pick a window or drag a region anywhere on the desktop — DSH itself stays visible — annotate it WeChat-style, then insert it into the draft, copy it, or save it.
 
+## What's new in 1.4.1
+
+- **Scrolling capture actually stitches now.** The overlap check used to demand a near pixel-perfect match, so a page that repaints while it scrolls (hover highlights, sticky bars, re-flowing CJK text) failed on almost every frame and the result was one screen tall. Frames now pass when either the mean difference is small or most *rows* still line up, and a second pass handles frames that barely overlap after a big jump.
+- **Pinned chrome is no longer stamped across the page.** A row that is identical to the same screen row of the previous frame (a sticky file header, a floating toolbar, a scrollbar) belongs to the viewport, not to the page; those rows are skipped, which removes the "band repeated dozens of times" artefact.
+- **The panel says why a frame was dropped** — "no overlap left, scroll in smaller steps or use Auto scroll" versus "frame would not line up, the page changed while scrolling" — instead of failing silently.
+- **Auto scroll** (the button in the scrolling panel) steps the region itself, keeps the mouse pointer where it is, and stops when it reaches the end.
+
+## What's new in 1.4.0
+
+- **Esc no longer needs focus.** It used to be handled by the overlay's `KeyDown`, so pressing Esc while DSH was minimised (or while another app had focus) did nothing. The editor now polls the physical key state every 30 ms (`GetAsyncKeyState`) and walks the same ladder — deselect shape → leave the tool → drop the selection → cancel the capture. Escape while the scrolling panel is open closes only that panel, leaving your selection intact.
+- **Alt+A heals itself.** If the resident hotkey helper dies (killed, or a stale one still holding the hotkey), the Host restarts it with a 0.5 s → 15 s backoff, and clears leftover helpers first so a stale one cannot cause `register-failed 1409` and a silently dead shortcut.
+- **The scrolling capture keeps the region lit.** While it runs, a click-through mask dims everything outside the region and leaves the region itself untouched — the stitched pixels keep their true brightness — with a thin light frame around it, the same feel as the WeChat scrolling snip.
+
 ## What you get
 
 - One extra row in the `+` menu: **Screenshot** / 截图提问.
